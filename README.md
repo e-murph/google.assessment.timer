@@ -1,4 +1,4 @@
-# Free timed candidate assessment using Google Apps Script
+# Timed candidate assessment using Google Apps Script
 
 This package creates a Google Apps Script web app that:
 
