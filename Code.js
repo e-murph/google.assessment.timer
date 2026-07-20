@@ -457,6 +457,7 @@ function saveAndNext(payload) {
     }
 
     const now = new Date();
+    const requestSettings = getSettings_();
     const overTime = now.getTime() > session.deadlineAt.getTime();
     const forceComplete = Boolean(payload.forceComplete);
     const submissionId = truncate_(String(payload.submissionId || Utilities.getUuid()), 200);
@@ -518,13 +519,11 @@ function saveAndNext(payload) {
       receivedAt: now,
       elapsedMs,
       submissionId,
+      settings: requestSettings,
     });
 
     appendSnapshotRows_(snapshots);
-    const questionSnapshotCount = countSnapshotsForQuestion_(
-      session.sessionId,
-      question.id
-    );
+    const snapshotCounts = getSnapshotCounts_(session.sessionId, question.id);
 
     upsertResponseForQuestion_(session.sessionId, question.id, {
       SessionID: session.sessionId,
@@ -562,7 +561,7 @@ function saveAndNext(payload) {
       RedoCount: redoCount,
       LastEditSecondsClient: lastEditMs == null ? '' : round_(lastEditMs / 1000, 2),
       EditingSpanSecondsClient: editingSpanMs == null ? '' : round_(editingSpanMs / 1000, 2),
-      SnapshotCount: questionSnapshotCount,
+      SnapshotCount: snapshotCounts.question,
       SubmissionID: safeForSheet_(submissionId),
       ClientTelemetryStatus: 'UNVERIFIED_CLIENT_REPORTED',
     });
@@ -591,7 +590,7 @@ function saveAndNext(payload) {
         TotalRevisionEvents: session.totalRevisionEvents + revisionEvents,
         TotalUndoCount: session.totalUndoCount + undoCount,
         TotalRedoCount: session.totalRedoCount + redoCount,
-        TotalSnapshotCount: countSnapshotsForSession_(session.sessionId),
+        TotalSnapshotCount: snapshotCounts.session,
       });
       updateCandidateStatusByToken_(session.token, finalStatus);
 
@@ -623,11 +622,14 @@ function saveAndNext(payload) {
       TotalRevisionEvents: session.totalRevisionEvents + revisionEvents,
       TotalUndoCount: session.totalUndoCount + undoCount,
       TotalRedoCount: session.totalRedoCount + redoCount,
-      TotalSnapshotCount: countSnapshotsForSession_(session.sessionId),
+      TotalSnapshotCount: snapshotCounts.session,
     });
 
-    const updatedSession = findSessionById_(session.sessionId);
-    return buildClientState_(updatedSession, questions, now);
+    session.currentQuestionIndex = nextIndex;
+    session.currentQuestionShownAt = now;
+    session.lastActivityAt = now;
+    session.totalSnapshotCount = snapshotCounts.session;
+    return buildClientState_(session, questions, now, requestSettings);
   } finally {
     lock.releaseLock();
   }
@@ -644,7 +646,13 @@ function saveProgress(payload) {
   if (!sessionId) return failure_('The assessment session is missing.');
 
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  if (!lock.tryLock(500)) {
+    return {
+      ok: false,
+      retry: true,
+      message: 'Snapshot save deferred while another assessment submission is being processed.',
+    };
+  }
 
   try {
     const session = findSessionById_(sessionId);
@@ -804,21 +812,41 @@ function appendMappedRow_(sheetName, valuesByHeader) {
 }
 
 function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
-  const table = getTable_(APP.SHEETS.RESPONSES);
-  let rowIndex = -1;
-  for (let index = table.rows.length - 1; index >= 0; index -= 1) {
-    const row = table.rows[index];
-    if (
-      String(row[table.map.SessionID] || '').trim() === sessionId &&
-      String(row[table.map.QuestionID] || '').trim() === questionId
-    ) {
-      rowIndex = index;
-      break;
+  const table = getTableStructure_(APP.SHEETS.RESPONSES);
+  const lastRow = table.sheet.getLastRow();
+  let sheetRow = -1;
+  const submissionId = String(valuesByHeader.SubmissionID || '').trim();
+
+  if (lastRow > 1 && submissionId) {
+    const match = table.sheet
+      .getRange(2, table.map.SubmissionID + 1, lastRow - 1, 1)
+      .createTextFinder(submissionId)
+      .matchEntireCell(true)
+      .findNext();
+    if (match) sheetRow = match.getRow();
+  }
+
+  // Compatibility fallback for submissions made before SubmissionID existed.
+  if (sheetRow < 0 && lastRow > 1) {
+    const sessionMatches = table.sheet
+      .getRange(2, table.map.SessionID + 1, lastRow - 1, 1)
+      .createTextFinder(sessionId)
+      .matchEntireCell(true)
+      .findAll();
+    for (let index = sessionMatches.length - 1; index >= 0; index -= 1) {
+      const candidateRow = sessionMatches[index].getRow();
+      const storedQuestionId = table.sheet
+        .getRange(candidateRow, table.map.QuestionID + 1)
+        .getValue();
+      if (String(storedQuestionId || '').trim() === questionId) {
+        sheetRow = candidateRow;
+        break;
+      }
     }
   }
 
-  const row = rowIndex >= 0
-    ? table.rows[rowIndex].slice()
+  const row = sheetRow >= 0
+    ? table.sheet.getRange(sheetRow, 1, 1, table.headers.length).getValues()[0]
     : Array(table.headers.length).fill('');
   Object.keys(valuesByHeader).forEach((header) => {
     if (!(header in table.map)) {
@@ -827,45 +855,65 @@ function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
     row[table.map[header]] = valuesByHeader[header];
   });
 
-  if (rowIndex >= 0) {
-    table.sheet.getRange(rowIndex + 2, 1, 1, table.headers.length).setValues([row]);
+  if (sheetRow >= 0) {
+    table.sheet.getRange(sheetRow, 1, 1, table.headers.length).setValues([row]);
   } else {
     table.sheet.appendRow(row);
   }
 }
 
-function countSnapshotsForQuestion_(sessionId, questionId) {
-  const table = getTable_(APP.SHEETS.SNAPSHOTS);
-  return table.rows.reduce((count, row) => {
-    return count + (
-      String(row[table.map.SessionID] || '').trim() === sessionId &&
-      String(row[table.map.QuestionID] || '').trim() === questionId
-        ? 1
-        : 0
-    );
-  }, 0);
-}
+function getSnapshotCounts_(sessionId, questionId) {
+  const table = getTableStructure_(APP.SHEETS.SNAPSHOTS);
+  const lastRow = table.sheet.getLastRow();
+  if (lastRow <= 1) return { question: 0, session: 0 };
 
-function countSnapshotsForSession_(sessionId) {
-  const table = getTable_(APP.SHEETS.SNAPSHOTS);
-  return table.rows.reduce((count, row) => {
-    return count + (
-      String(row[table.map.SessionID] || '').trim() === sessionId ? 1 : 0
-    );
-  }, 0);
+  const firstColumn = Math.min(table.map.SessionID, table.map.QuestionID);
+  const lastColumn = Math.max(table.map.SessionID, table.map.QuestionID);
+  const values = table.sheet
+    .getRange(2, firstColumn + 1, lastRow - 1, lastColumn - firstColumn + 1)
+    .getValues();
+  const sessionOffset = table.map.SessionID - firstColumn;
+  const questionOffset = table.map.QuestionID - firstColumn;
+  let sessionCount = 0;
+  let questionCount = 0;
+  values.forEach((row) => {
+    if (String(row[sessionOffset] || '').trim() !== sessionId) return;
+    sessionCount += 1;
+    if (String(row[questionOffset] || '').trim() === questionId) questionCount += 1;
+  });
+  return { question: questionCount, session: sessionCount };
 }
 
 function appendSnapshotRows_(snapshots) {
   if (!snapshots.length) return;
-  const table = getTable_(APP.SHEETS.SNAPSHOTS);
-  const existingIds = new Set(
-    table.rows
-      .map((row) => String(row[table.map.SnapshotID] || '').trim())
-      .filter(Boolean)
-  );
+  const table = getTableStructure_(APP.SHEETS.SNAPSHOTS);
+  const lastRow = table.sheet.getLastRow();
+  const snapshotIdRange = lastRow > 1
+    ? table.sheet.getRange(2, table.map.SnapshotID + 1, lastRow - 1, 1)
+    : null;
+  const existingIds = snapshots.length > 10 && snapshotIdRange
+    ? new Set(
+        snapshotIdRange
+          .getValues()
+          .map((row) => String(row[0] || '').trim())
+          .filter(Boolean)
+      )
+    : new Set();
+  const batchIds = new Set();
   const newSnapshots = snapshots.filter((snapshot) => {
     const snapshotId = String(snapshot.SnapshotID || '').trim();
-    if (!snapshotId || existingIds.has(snapshotId)) return false;
+    if (!snapshotId || batchIds.has(snapshotId) || existingIds.has(snapshotId)) return false;
+    if (
+      snapshotIdRange &&
+      snapshots.length <= 10 &&
+      snapshotIdRange
+        .createTextFinder(snapshotId)
+        .matchEntireCell(true)
+        .findNext()
+    ) {
+      return false;
+    }
+    batchIds.add(snapshotId);
     existingIds.add(snapshotId);
     return true;
   });
@@ -887,7 +935,7 @@ function appendSnapshotRows_(snapshots) {
 function normaliseSnapshots_(rawSnapshots, context) {
   if (!Array.isArray(rawSnapshots)) return [];
 
-  const settings = getSettings_();
+  const settings = context.settings || getSettings_();
   const storeSnapshotText = toBoolean_(settings.StoreSnapshotText);
   const maximumSnapshots = 250;
   const maximumTextCharacters = 20000;
@@ -950,14 +998,15 @@ function normaliseSnapshots_(rawSnapshots, context) {
   });
 }
 
-function getTable_(sheetName) {
+function getTableStructure_(sheetName) {
   const sheet = getSpreadsheet_().getSheetByName(sheetName);
   if (!sheet) throw new Error(`Required sheet not found: ${sheetName}`);
 
-  const lastRow = Math.max(sheet.getLastRow(), 1);
   const lastColumn = Math.max(sheet.getLastColumn(), 1);
-  const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
-  const headers = values[0].map((value) => String(value).trim());
+  const headers = sheet
+    .getRange(1, 1, 1, lastColumn)
+    .getValues()[0]
+    .map((value) => String(value).trim());
   const blankHeaderIndex = headers.findIndex((header) => !header);
   if (blankHeaderIndex >= 0) {
     throw new Error(
@@ -992,7 +1041,18 @@ function getTable_(sheetName) {
     sheet,
     headers,
     map,
-    rows: values.slice(1),
+  };
+}
+
+function getTable_(sheetName) {
+  const table = getTableStructure_(sheetName);
+  const lastRow = table.sheet.getLastRow();
+  const rows = lastRow > 1
+    ? table.sheet.getRange(2, 1, lastRow - 1, table.headers.length).getValues()
+    : [];
+  return {
+    ...table,
+    rows,
   };
 }
 
@@ -1120,15 +1180,38 @@ function saveSessionQuestions_(sessionId, questions) {
       .getRange(table.sheet.getLastRow() + 1, 1, rows.length, table.headers.length)
       .setValues(rows);
   }
+  cacheSessionQuestions_(sessionId, questions);
 }
 
 function getQuestionsForSession_(session, fallbackQuestions) {
+  const cachedQuestions = readCachedSessionQuestions_(session.sessionId);
+  if (cachedQuestions) return cachedQuestions;
+
   const sheet = getSpreadsheet_().getSheetByName(APP.SHEETS.SESSION_QUESTIONS);
   if (!sheet) return fallbackQuestions || getQuestions_();
 
-  const table = getTable_(APP.SHEETS.SESSION_QUESTIONS);
-  const questions = table.rows
-    .filter((row) => String(row[table.map.SessionID] || '').trim() === session.sessionId)
+  const table = getTableStructure_(APP.SHEETS.SESSION_QUESTIONS);
+  const lastRow = table.sheet.getLastRow();
+  if (lastRow <= 1) return fallbackQuestions || getQuestions_();
+
+  const sessionIdValues = table.sheet
+    .getRange(2, table.map.SessionID + 1, lastRow - 1, 1)
+    .getValues();
+  const matchingRows = [];
+  sessionIdValues.forEach((row, index) => {
+    if (String(row[0] || '').trim() === session.sessionId) matchingRows.push(index + 2);
+  });
+  if (!matchingRows.length) return fallbackQuestions || getQuestions_();
+
+  const firstRow = matchingRows[0];
+  const finalRow = matchingRows[matchingRows.length - 1];
+  const matchingRowSet = new Set(matchingRows);
+  const questions = table.sheet
+    .getRange(firstRow, 1, finalRow - firstRow + 1, table.headers.length)
+    .getValues()
+    .map((row, offset) => ({ row, sheetRow: firstRow + offset }))
+    .filter((entry) => matchingRowSet.has(entry.sheetRow))
+    .map((entry) => entry.row)
     .map((row) => {
       let options = [];
       try {
@@ -1155,32 +1238,60 @@ function getQuestionsForSession_(session, fallbackQuestions) {
       };
     });
 
-  if (!questions.length) return fallbackQuestions || getQuestions_();
   questions.sort((a, b) => a.index - b.index);
+  cacheSessionQuestions_(session.sessionId, questions);
   return questions;
 }
 
-function findCandidateByToken_(token) {
-  const table = getTable_(APP.SHEETS.CANDIDATES);
-  let match = null;
-  for (let i = 0; i < table.rows.length; i += 1) {
-    const row = table.rows[i];
-    if (String(row[table.map.Token] || '').trim() === token) {
-      if (match) {
-        throw new Error(
-          `This token is assigned to more than one candidate (rows ${match.rowNumber} and ${i + 2}). Correct the Candidates sheet before continuing.`
-        );
-      }
-      match = {
-        rowNumber: i + 2,
-        name: String(row[table.map.CandidateName] || '').trim(),
-        email: String(row[table.map.CandidateEmail] || '').trim(),
-        active: toBoolean_(row[table.map.Active]),
-        status: String(row[table.map.Status] || '').trim().toUpperCase(),
-      };
-    }
+function cacheSessionQuestions_(sessionId, questions) {
+  try {
+    CacheService.getScriptCache().put(
+      `session-questions:${sessionId}`,
+      JSON.stringify(questions),
+      21600
+    );
+  } catch (error) {
+    // Large question sets can exceed cache limits; the Sheet remains authoritative.
   }
-  return match;
+}
+
+function readCachedSessionQuestions_(sessionId) {
+  try {
+    const value = CacheService.getScriptCache().get(`session-questions:${sessionId}`);
+    if (!value) return null;
+    const questions = JSON.parse(value);
+    return Array.isArray(questions) && questions.length ? questions : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function findCandidateByToken_(token) {
+  const table = getTableStructure_(APP.SHEETS.CANDIDATES);
+  const lastRow = table.sheet.getLastRow();
+  if (lastRow <= 1) return null;
+  const matches = table.sheet
+    .getRange(2, table.map.Token + 1, lastRow - 1, 1)
+    .createTextFinder(token)
+    .matchEntireCell(true)
+    .findAll();
+  if (!matches.length) return null;
+  if (matches.length > 1) {
+    throw new Error(
+      `This token is assigned to more than one candidate (rows ${matches
+        .map((match) => match.getRow())
+        .join(' and ')}). Correct the Candidates sheet before continuing.`
+    );
+  }
+  const rowNumber = matches[0].getRow();
+  const row = table.sheet.getRange(rowNumber, 1, 1, table.headers.length).getValues()[0];
+  return {
+    rowNumber,
+    name: String(row[table.map.CandidateName] || '').trim(),
+    email: String(row[table.map.CandidateEmail] || '').trim(),
+    active: toBoolean_(row[table.map.Active]),
+    status: String(row[table.map.Status] || '').trim().toUpperCase(),
+  };
 }
 
 function findDuplicateCandidateTokens_(table) {
@@ -1197,7 +1308,7 @@ function findDuplicateCandidateTokens_(table) {
 }
 
 function updateCandidateStatus_(rowNumber, status) {
-  const table = getTable_(APP.SHEETS.CANDIDATES);
+  const table = getTableStructure_(APP.SHEETS.CANDIDATES);
   table.sheet.getRange(rowNumber, table.map.Status + 1).setValue(status);
 }
 
@@ -1207,23 +1318,33 @@ function updateCandidateStatusByToken_(token, status) {
 }
 
 function findLatestSessionByToken_(token) {
-  const table = getTable_(APP.SHEETS.SESSIONS);
-  for (let i = table.rows.length - 1; i >= 0; i -= 1) {
-    if (String(table.rows[i][table.map.Token] || '').trim() === token) {
-      return sessionFromRow_(table.rows[i], i + 2, table.map);
-    }
-  }
-  return null;
+  const table = getTableStructure_(APP.SHEETS.SESSIONS);
+  const lastRow = table.sheet.getLastRow();
+  if (lastRow <= 1) return null;
+  const matches = table.sheet
+    .getRange(2, table.map.Token + 1, lastRow - 1, 1)
+    .createTextFinder(token)
+    .matchEntireCell(true)
+    .findAll();
+  if (!matches.length) return null;
+  const rowNumber = Math.max(...matches.map((match) => match.getRow()));
+  const row = table.sheet.getRange(rowNumber, 1, 1, table.headers.length).getValues()[0];
+  return sessionFromRow_(row, rowNumber, table.map);
 }
 
 function findSessionById_(sessionId) {
-  const table = getTable_(APP.SHEETS.SESSIONS);
-  for (let i = table.rows.length - 1; i >= 0; i -= 1) {
-    if (String(table.rows[i][table.map.SessionID] || '').trim() === sessionId) {
-      return sessionFromRow_(table.rows[i], i + 2, table.map);
-    }
-  }
-  return null;
+  const table = getTableStructure_(APP.SHEETS.SESSIONS);
+  const lastRow = table.sheet.getLastRow();
+  if (lastRow <= 1) return null;
+  const match = table.sheet
+    .getRange(2, table.map.SessionID + 1, lastRow - 1, 1)
+    .createTextFinder(sessionId)
+    .matchEntireCell(true)
+    .findNext();
+  if (!match) return null;
+  const rowNumber = match.getRow();
+  const row = table.sheet.getRange(rowNumber, 1, 1, table.headers.length).getValues()[0];
+  return sessionFromRow_(row, rowNumber, table.map);
 }
 
 function sessionFromRow_(row, rowNumber, map) {
@@ -1256,7 +1377,7 @@ function sessionFromRow_(row, rowNumber, map) {
 }
 
 function updateSession_(rowNumber, updates) {
-  const table = getTable_(APP.SHEETS.SESSIONS);
+  const table = getTableStructure_(APP.SHEETS.SESSIONS);
   const row = table.sheet
     .getRange(rowNumber, 1, 1, table.headers.length)
     .getValues()[0];
@@ -1277,10 +1398,10 @@ function completeSession_(session, status, completedAt) {
   });
 }
 
-function buildClientState_(session, questions, now) {
+function buildClientState_(session, questions, now, suppliedSettings) {
   const index = Number(session.currentQuestionIndex);
   const question = questions[index];
-  const settings = getSettings_();
+  const settings = suppliedSettings || getSettings_();
   const snapshotIntervalSeconds = Math.min(
     300,
     Math.max(5, Number(settings.SnapshotIntervalSeconds) || 15)
