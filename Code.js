@@ -158,7 +158,7 @@ function setupAssessment() {
   ensureSetting_(
     settings,
     'PrivacyNotice',
-    'This assessment records response times, active browser time, answer-construction statistics, periodic answer snapshots, paste events, and occasions when the assessment tab loses visibility or focus. These indicators support assessment review and are not treated as conclusive proof of AI use.'
+    'This assessment records response times, active browser time, answer-construction statistics, periodic answer snapshots, paste events, and occasions when the assessment tab loses visibility or focus. This information is used to support human review of assessment integrity. These indicators are not treated as conclusive proof that artificial intelligence or another unauthorised tool was used.'
   );
 
   if (questions.getLastRow() <= 1) {
