@@ -7,8 +7,9 @@
  * 2. Paste the full EDIT URL of the Google Form in the Value column.
  * 3. Run importQuestionsFromExistingForm from the Apps Script editor.
  *
- * This replaces the current rows in the Questions sheet. It does not modify
- * the source Google Form or its existing responses.
+ * This updates previously imported GF_ questions by QuestionID and appends new
+ * ones. It preserves unrelated Questions rows, prior import logs, the source
+ * Google Form, and its existing responses.
  */
 function importQuestionsFromExistingForm() {
   const settings = getSettings_();
@@ -135,16 +136,16 @@ function importQuestionsFromExistingForm() {
 
     questionOrder += 1;
     const questionId = `GF_${item.getId()}`;
-    rows.push([
-      questionOrder,
-      questionId,
-      groupId,
-      imported.text,
-      imported.answerType,
-      imported.options.map(cleanImportedOption_).join('|'),
-      imported.required,
-      '',
-    ]);
+    rows.push({
+      Order: questionOrder,
+      QuestionID: questionId,
+      GroupID: groupId,
+      QuestionText: imported.text,
+      AnswerType: imported.answerType,
+      Options: imported.options.map(cleanImportedOption_).join('|'),
+      Required: imported.required,
+      MaxWords: '',
+    });
 
     logRows.push([
       itemIndex + 1,
@@ -160,36 +161,82 @@ function importQuestionsFromExistingForm() {
     throw new Error('No compatible questions were found in the source Google Form.');
   }
 
-  const ss = getSpreadsheet_();
-  const questionsSheet = ss.getSheetByName(APP.SHEETS.QUESTIONS);
-  if (!questionsSheet) {
-    throw new Error('Questions sheet not found. Run setupAssessment first.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+
+  let addedCount = 0;
+  let updatedCount = 0;
+  try {
+    const ss = getSpreadsheet_();
+    const table = getTable_(APP.SHEETS.QUESTIONS);
+    const mergedRows = table.rows.map((row) => row.slice());
+    const rowIndexByQuestionId = {};
+    const importOrderBase = mergedRows.reduce((maximum, row) => {
+      const order = Number(row[table.map.Order]);
+      return Number.isFinite(order) ? Math.max(maximum, order) : maximum;
+    }, 0);
+
+    mergedRows.forEach((row, index) => {
+      const questionId = String(row[table.map.QuestionID] || '').trim();
+      if (!questionId) return;
+      if (questionId in rowIndexByQuestionId) {
+        throw new Error(
+          `Questions contains duplicate QuestionID ${questionId}. Correct it before importing.`
+        );
+      }
+      rowIndexByQuestionId[questionId] = index;
+    });
+
+    rows.forEach((valuesByHeader) => {
+      valuesByHeader.Order = importOrderBase + valuesByHeader.Order;
+      const questionId = valuesByHeader.QuestionID;
+      const existingIndex = rowIndexByQuestionId[questionId];
+      const row = existingIndex == null
+        ? Array(table.headers.length).fill('')
+        : mergedRows[existingIndex].slice();
+
+      Object.keys(valuesByHeader).forEach((header) => {
+        if (!(header in table.map)) {
+          throw new Error(`Questions is missing ${header}. Run setupAssessment.`);
+        }
+        const value = valuesByHeader[header];
+        if (existingIndex != null && header === 'MaxWords' && value === '') return;
+        row[table.map[header]] = typeof value === 'string' ? safeForSheet_(value) : value;
+      });
+
+      if (existingIndex == null) {
+        rowIndexByQuestionId[questionId] = mergedRows.length;
+        mergedRows.push(row);
+        addedCount += 1;
+      } else {
+        mergedRows[existingIndex] = row;
+        updatedCount += 1;
+      }
+    });
+
+    table.sheet
+      .getRange(2, 1, mergedRows.length, table.headers.length)
+      .setValues(mergedRows);
+    table.sheet.autoResizeColumns(1, table.headers.length);
+
+    const logSheetName = 'ImportLog';
+    const logSheet = ss.getSheetByName(logSheetName) || ss.insertSheet(logSheetName);
+    const logStartRow = logSheet.getLastRow() > 0 ? logSheet.getLastRow() + 2 : 1;
+    logSheet
+      .getRange(logStartRow, 1, logRows.length, logRows[0].length)
+      .setValues(logRows);
+    logSheet.setFrozenRows(1);
+    logSheet.autoResizeColumns(1, logRows[0].length);
+
+    updateSettingValue_('AssessmentTitle', form.getTitle());
+  } finally {
+    lock.releaseLock();
   }
-
-  if (questionsSheet.getLastRow() > 1) {
-    questionsSheet
-      .getRange(2, 1, questionsSheet.getLastRow() - 1, questionsSheet.getLastColumn())
-      .clearContent();
-  }
-
-  questionsSheet
-    .getRange(2, 1, rows.length, HEADERS.QUESTIONS.length)
-    .setValues(rows);
-  questionsSheet.autoResizeColumns(1, HEADERS.QUESTIONS.length);
-
-  const logSheetName = 'ImportLog';
-  const oldLog = ss.getSheetByName(logSheetName);
-  if (oldLog) ss.deleteSheet(oldLog);
-  const logSheet = ss.insertSheet(logSheetName);
-  logSheet.getRange(1, 1, logRows.length, logRows[0].length).setValues(logRows);
-  logSheet.setFrozenRows(1);
-  logSheet.autoResizeColumns(1, logRows[0].length);
-
-  updateSettingValue_('AssessmentTitle', form.getTitle());
 
   return [
     `Imported ${rows.length} questions from “${form.getTitle()}”.`,
-    `Reviewed ${items.length} total form items.`,
+    `Added ${addedCount} questions and updated ${updatedCount} existing imported questions.`,
+    `Reviewed ${items.length} total form items. Existing unrelated questions and prior ImportLog entries were preserved.`,
     'Open the ImportLog sheet to review skipped or converted items.',
   ].join('\n');
 }
@@ -213,7 +260,7 @@ function cleanImportedOption_(value) {
 
 function unsupportedTypeNote_(typeName) {
   const notes = {
-    CHECKBOX: 'Checkbox questions require multi-select support in Index.html and Code.gs.',
+    CHECKBOX: 'Checkbox questions require multi-select support in Index.html and Code.js.',
     CHECKBOX_GRID: 'Checkbox grids require a custom grid/multi-select interface.',
     GRID: 'Multiple-choice grids require a custom grid interface.',
     DATE: 'Date validation is not supported by the current timer page.',

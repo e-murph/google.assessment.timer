@@ -64,6 +64,7 @@ const HEADERS = Object.freeze({
     'TotalUndoCount',
     'TotalRedoCount',
     'TotalSnapshotCount',
+    'ClientTelemetryStatus',
   ],
   RESPONSES: [
     'SessionID',
@@ -102,6 +103,7 @@ const HEADERS = Object.freeze({
     'EditingSpanSecondsClient',
     'SnapshotCount',
     'SubmissionID',
+    'ClientTelemetryStatus',
   ],
   SNAPSHOTS: [
     'SessionID',
@@ -131,6 +133,7 @@ const HEADERS = Object.freeze({
     'ServerReceivedAt',
     'SnapshotID',
     'SubmissionID',
+    'ClientTelemetryStatus',
   ],
   SESSION_QUESTIONS: [
     'SessionID',
@@ -176,6 +179,11 @@ function setupAssessment() {
   ensureSetting_(settings, 'SourceFormUrl', '');
   ensureSetting_(settings, 'SnapshotIntervalSeconds', 15);
   ensureSetting_(settings, 'StoreSnapshotText', true);
+  ensureSetting_(
+    settings,
+    'TelemetryInterpretation',
+    'Client telemetry is unverified, may be incomplete or manipulated, and must be treated only as supporting information for human review—not as proof of AI use or misconduct.'
+  );
   ensureSetting_(
     settings,
     'PrivacyNotice',
@@ -235,10 +243,23 @@ function generateCandidateTokens() {
     if (table.rows.length === 0) {
       throw new Error('Add at least one candidate to the Candidates sheet.');
     }
+    const duplicateTokens = findDuplicateCandidateTokens_(table);
+    if (duplicateTokens.length) {
+      throw new Error(
+        `Duplicate candidate token(s) found in rows ${duplicateTokens
+          .map((duplicate) => duplicate.rows.join(' and '))
+          .join(', ')}. Give each candidate a unique token before generating links.`
+      );
+    }
 
     const settings = getSettings_();
     const webAppUrl = String(settings.WebAppUrl || '').trim();
     const hasValidUrl = /^https:\/\/script\.google\.com\//i.test(webAppUrl);
+    const usedTokens = new Set(
+      table.rows
+        .map((row) => String(row[table.map.Token] || '').trim())
+        .filter(Boolean)
+    );
 
     table.rows.forEach((row) => {
       const name = String(row[table.map.CandidateName] || '').trim();
@@ -247,8 +268,11 @@ function generateCandidateTokens() {
 
       let token = String(row[table.map.Token] || '').trim();
       if (!token) {
-        token = Utilities.getUuid().replace(/-/g, '');
+        do {
+          token = Utilities.getUuid().replace(/-/g, '');
+        } while (usedTokens.has(token));
         row[table.map.Token] = token;
+        usedTokens.add(token);
       }
 
       if (row[table.map.Active] === '') {
@@ -332,9 +356,11 @@ function startAssessment(token, clientInfo) {
     }
 
     if (questions.length === 0) return failure_('No assessment questions have been configured.');
-    const uniqueQuestionIds = new Set(questions.map((question) => question.id));
-    if (uniqueQuestionIds.size !== questions.length) {
-      return failure_('The assessment contains duplicate QuestionID values. Ask the administrator to correct the Questions sheet.');
+    const questionProblems = getQuestionConfigurationProblems_(questions);
+    if (questionProblems.length) {
+      return failure_(
+        `The assessment question configuration is invalid: ${questionProblems.join(' ')}`
+      );
     }
 
     const startedAt = now;
@@ -369,6 +395,7 @@ function startAssessment(token, clientInfo) {
       TotalUndoCount: 0,
       TotalRedoCount: 0,
       TotalSnapshotCount: 0,
+      ClientTelemetryStatus: 'UNVERIFIED_CLIENT_REPORTED',
     });
 
     updateCandidateStatus_(candidate.rowNumber, 'IN_PROGRESS');
@@ -453,7 +480,10 @@ function saveAndNext(payload) {
     const shownAt = session.currentQuestionShownAt;
     const elapsedMs = Math.max(0, now.getTime() - shownAt.getTime());
     const activeMs = Math.min(elapsedMs, nonNegativeNumber_(payload.activeMs));
-    const firstInteractionMs = nullableNonNegativeNumber_(payload.firstInteractionMs);
+    const firstInteractionValue = nullableNonNegativeNumber_(payload.firstInteractionMs);
+    const firstInteractionMs = firstInteractionValue == null
+      ? null
+      : Math.min(elapsedMs, firstInteractionValue);
     const pasteCount = nonNegativeInteger_(payload.pasteCount);
     const tabLeaveCount = nonNegativeInteger_(payload.tabLeaveCount);
     const blurCount = nonNegativeInteger_(payload.blurCount);
@@ -466,7 +496,8 @@ function saveAndNext(payload) {
     const revisionEvents = nonNegativeInteger_(payload.revisionEvents);
     const undoCount = nonNegativeInteger_(payload.undoCount);
     const redoCount = nonNegativeInteger_(payload.redoCount);
-    const lastEditMs = nullableNonNegativeNumber_(payload.lastEditMs);
+    const lastEditValue = nullableNonNegativeNumber_(payload.lastEditMs);
+    const lastEditMs = lastEditValue == null ? null : Math.min(elapsedMs, lastEditValue);
     const editingSpanMs =
       firstInteractionMs == null || lastEditMs == null
         ? null
@@ -528,6 +559,7 @@ function saveAndNext(payload) {
       EditingSpanSecondsClient: editingSpanMs == null ? '' : round_(editingSpanMs / 1000, 2),
       SnapshotCount: questionSnapshotCount,
       SubmissionID: safeForSheet_(submissionId),
+      ClientTelemetryStatus: 'UNVERIFIED_CLIENT_REPORTED',
     });
 
     const nextIndex = index + 1;
@@ -682,19 +714,12 @@ function validateAssessmentSetup() {
     });
   });
 
-  const ids = new Set();
-  questions.forEach((question) => {
-    if (ids.has(question.id)) problems.push(`Duplicate QuestionID: ${question.id}`);
-    ids.add(question.id);
-    if (!['short_text', 'long_text', 'multiple_choice'].includes(question.answerType)) {
-      problems.push(`Unsupported AnswerType for ${question.id}: ${question.answerType}`);
-    }
-    if (question.answerType === 'multiple_choice' && question.options.length < 2) {
-      problems.push(`Multiple-choice question ${question.id} needs at least two options.`);
-    }
-  });
+  problems.push(...getQuestionConfigurationProblems_(questions));
 
   if (candidates.rows.length === 0) problems.push('No candidates are configured.');
+  findDuplicateCandidateTokens_(candidates).forEach((duplicate) => {
+    problems.push(`Duplicate candidate token in rows ${duplicate.rows.join(' and ')}.`);
+  });
   return problems.length ? problems.join('\n') : 'Setup looks valid.';
 }
 
@@ -717,6 +742,19 @@ function ensureSheet_(ss, name, headers) {
     sheet.getLastRow() > 0 && lastColumn > 0
       ? sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map((value) => String(value).trim())
       : [];
+
+  const nonBlankHeaders = existingHeaders.filter(Boolean);
+  const duplicateHeaders = nonBlankHeaders.filter(
+    (header, index) => nonBlankHeaders.indexOf(header) !== index
+  );
+  if (duplicateHeaders.length) {
+    throw new Error(
+      `${name} contains duplicate header(s): ${[...new Set(duplicateHeaders)].join(', ')}. Correct row 1 before running setupAssessment.`
+    );
+  }
+  if (existingHeaders.some((header) => !header) && nonBlankHeaders.length) {
+    throw new Error(`${name} contains a blank header in row 1. Correct it before running setupAssessment.`);
+  }
 
   if (existingHeaders.length === 0 || existingHeaders.every((header) => !header)) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -897,6 +935,7 @@ function normaliseSnapshots_(rawSnapshots, context) {
       ServerReceivedAt: context.receivedAt,
       SnapshotID: safeForSheet_(snapshotId),
       SubmissionID: safeForSheet_(context.submissionId || ''),
+      ClientTelemetryStatus: 'UNVERIFIED_CLIENT_REPORTED',
     };
   });
 }
@@ -909,10 +948,35 @@ function getTable_(sheetName) {
   const lastColumn = Math.max(sheet.getLastColumn(), 1);
   const values = sheet.getRange(1, 1, lastRow, lastColumn).getValues();
   const headers = values[0].map((value) => String(value).trim());
+  const blankHeaderIndex = headers.findIndex((header) => !header);
+  if (blankHeaderIndex >= 0) {
+    throw new Error(
+      `${sheetName} has a blank header in column ${blankHeaderIndex + 1}. Correct row 1 before continuing.`
+    );
+  }
+  const duplicateHeaders = headers.filter(
+    (header, index) => headers.indexOf(header) !== index
+  );
+  if (duplicateHeaders.length) {
+    throw new Error(
+      `${sheetName} contains duplicate header(s): ${[...new Set(duplicateHeaders)].join(', ')}.`
+    );
+  }
   const map = {};
   headers.forEach((header, index) => {
     map[header] = index;
   });
+
+  const sheetKey = Object.keys(APP.SHEETS).find((key) => APP.SHEETS[key] === sheetName);
+  const expectedHeaders = sheetKey ? HEADERS[sheetKey] : null;
+  if (expectedHeaders) {
+    const missingHeaders = expectedHeaders.filter((header) => !(header in map));
+    if (missingHeaders.length) {
+      throw new Error(
+        `${sheetName} is missing required column(s): ${missingHeaders.join(', ')}. Run setupAssessment.`
+      );
+    }
+  }
 
   return {
     sheet,
@@ -940,9 +1004,15 @@ function getQuestions_() {
     const text = String(row[table.map.QuestionText] || '').trim();
     if (!text) return;
 
-    const orderValue = Number(row[table.map.Order]);
-    const order = Number.isFinite(orderValue) ? orderValue : rowIndex + 1;
-    const id = String(row[table.map.QuestionID] || `Q${order}`).trim();
+    const rawOrder = row[table.map.Order];
+    const orderValue = Number(rawOrder);
+    const hasExplicitOrder = String(rawOrder == null ? '' : rawOrder).trim() !== '';
+    const hasValidOrder = hasExplicitOrder && Number.isFinite(orderValue) && orderValue > 0;
+    const order = hasValidOrder
+      ? orderValue
+      : rowIndex + 1;
+    const configuredId = String(row[table.map.QuestionID] || '').trim();
+    const id = configuredId || `Q${order}`;
     const answerType = String(row[table.map.AnswerType] || 'long_text')
       .trim()
       .toLowerCase();
@@ -951,10 +1021,15 @@ function getQuestions_() {
       .map((option) => option.trim())
       .filter(Boolean);
     const maxWordsValue = Number(row[table.map.MaxWords]);
+    const hasMaxWords = String(row[table.map.MaxWords] == null ? '' : row[table.map.MaxWords]).trim() !== '';
 
     questions.push({
       order,
       id,
+      hasExplicitOrder,
+      hasValidOrder,
+      hasExplicitId: Boolean(configuredId),
+      invalidMaxWords: hasMaxWords && !(Number.isFinite(maxWordsValue) && maxWordsValue > 0),
       groupId: String(row[table.map.GroupID] || '').trim(),
       text,
       answerType,
@@ -966,6 +1041,41 @@ function getQuestions_() {
 
   questions.sort((a, b) => a.order - b.order);
   return questions;
+}
+
+function getQuestionConfigurationProblems_(questions) {
+  const problems = [];
+  const ids = new Set();
+  const orders = new Set();
+  const supportedTypes = new Set(['short_text', 'long_text', 'multiple_choice']);
+
+  questions.forEach((question) => {
+    if (question.hasExplicitId === false) {
+      problems.push(`Question at order ${question.order} needs a QuestionID.`);
+    }
+    if (question.hasValidOrder === false) {
+      problems.push(`Question ${question.id} needs a positive numeric Order.`);
+    }
+    if (ids.has(question.id)) problems.push(`Duplicate QuestionID: ${question.id}.`);
+    ids.add(question.id);
+    if (orders.has(question.order)) problems.push(`Duplicate question Order: ${question.order}.`);
+    orders.add(question.order);
+    if (!supportedTypes.has(question.answerType)) {
+      problems.push(`Unsupported AnswerType for ${question.id}: ${question.answerType}.`);
+    }
+    if (question.answerType === 'multiple_choice') {
+      if (question.options.length < 2) {
+        problems.push(`Multiple-choice question ${question.id} needs at least two options.`);
+      }
+      if (new Set(question.options).size !== question.options.length) {
+        problems.push(`Multiple-choice question ${question.id} contains duplicate options.`);
+      }
+    }
+    if (question.invalidMaxWords) {
+      problems.push(`MaxWords for ${question.id} must be a positive number or blank.`);
+    }
+  });
+  return problems;
 }
 
 function saveSessionQuestions_(sessionId, questions) {
@@ -1042,10 +1152,16 @@ function getQuestionsForSession_(session, fallbackQuestions) {
 
 function findCandidateByToken_(token) {
   const table = getTable_(APP.SHEETS.CANDIDATES);
+  let match = null;
   for (let i = 0; i < table.rows.length; i += 1) {
     const row = table.rows[i];
     if (String(row[table.map.Token] || '').trim() === token) {
-      return {
+      if (match) {
+        throw new Error(
+          `This token is assigned to more than one candidate (rows ${match.rowNumber} and ${i + 2}). Correct the Candidates sheet before continuing.`
+        );
+      }
+      match = {
         rowNumber: i + 2,
         name: String(row[table.map.CandidateName] || '').trim(),
         email: String(row[table.map.CandidateEmail] || '').trim(),
@@ -1054,7 +1170,20 @@ function findCandidateByToken_(token) {
       };
     }
   }
-  return null;
+  return match;
+}
+
+function findDuplicateCandidateTokens_(table) {
+  const rowsByToken = {};
+  table.rows.forEach((row, index) => {
+    const token = String(row[table.map.Token] || '').trim();
+    if (!token) return;
+    if (!rowsByToken[token]) rowsByToken[token] = [];
+    rowsByToken[token].push(index + 2);
+  });
+  return Object.keys(rowsByToken)
+    .filter((token) => rowsByToken[token].length > 1)
+    .map((token) => ({ token, rows: rowsByToken[token] }));
 }
 
 function updateCandidateStatus_(rowNumber, status) {
@@ -1161,7 +1290,6 @@ function buildClientState_(session, questions, now) {
     completed: false,
     sessionId: session.sessionId,
     candidateName: session.candidateName,
-    candidateEmail: session.candidateEmail,
     startedAtMs: session.startedAt.getTime(),
     deadlineAtMs: session.deadlineAt.getTime(),
     serverNowMs: now.getTime(),

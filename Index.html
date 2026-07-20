@@ -3,6 +3,7 @@
   <head>
     <base target="_top">
     <meta charset="utf-8">
+    <meta name="referrer" content="no-referrer">
     <style>
       :root {
         font-family: Arial, Helvetica, sans-serif;
@@ -213,9 +214,29 @@
         completeMessage: document.getElementById('completeMessage'),
       };
 
-      const initialToken = document.body.dataset.initialToken || '';
+      const tokenFromUrl = document.body.dataset.initialToken || '';
+      document.body.removeAttribute('data-initial-token');
+      let initialToken = tokenFromUrl;
+      try {
+        if (tokenFromUrl) {
+          sessionStorage.setItem('assessmentCandidateToken', tokenFromUrl);
+        } else {
+          initialToken = sessionStorage.getItem('assessmentCandidateToken') || '';
+        }
+      } catch (error) {
+        // Session storage can be disabled; the original candidate link still works.
+      }
       els.tokenInput.value = initialToken;
       if (initialToken) els.tokenArea.classList.add('hidden');
+      if (tokenFromUrl && window.history && window.history.replaceState) {
+        try {
+          const cleanUrl = new URL(window.location.href);
+          cleanUrl.searchParams.delete('token');
+          window.history.replaceState({}, document.title, cleanUrl.toString());
+        } catch (error) {
+          // URL cleanup is a privacy improvement; it is not required to continue.
+        }
+      }
 
       let state = null;
       let metrics = null;
@@ -247,8 +268,18 @@
       window.addEventListener('blur', () => {
         if (!assessmentInProgress || !metrics) return;
         stopActiveSegment();
-        metrics.blurCount += 1;
-        persistState();
+        const metricsAtBlur = metrics;
+        setTimeout(() => {
+          if (
+            assessmentInProgress &&
+            metrics === metricsAtBlur &&
+            !document.hidden &&
+            !document.hasFocus()
+          ) {
+            metrics.blurCount += 1;
+            persistState();
+          }
+        }, 0);
       });
 
       window.addEventListener('focus', () => {
@@ -460,9 +491,9 @@
           const inputType = String(event.inputType || '');
           const isUndo = inputType === 'historyUndo';
           const isRedo = inputType === 'historyRedo';
+          const isDrop = inputType === 'insertFromDrop';
           const isPasteLike =
             inputType === 'insertFromPaste' ||
-            inputType === 'insertFromDrop' ||
             (pendingPasteAt > 0 && Date.now() - pendingPasteAt < 2000);
 
           if (answer !== previousAnswer) {
@@ -482,7 +513,7 @@
 
               if (isPasteLike) {
                 metrics.pastedCharacters += delta.insertedCharacters;
-              } else if (!isUndo && !isRedo) {
+              } else if (!isUndo && !isRedo && !isDrop) {
                 metrics.typedCharacters += delta.insertedCharacters;
               }
             }
@@ -509,10 +540,14 @@
           }, 0);
         });
 
-        input.addEventListener('keydown', () => {
+        input.addEventListener('keydown', (event) => {
           markFirstInteraction();
-          metrics.keyCount += 1;
-          if (metrics.keyCount % 10 === 0) persistState();
+          const isEditingKey =
+            event.key.length === 1 || ['Backspace', 'Delete', 'Enter'].includes(event.key);
+          if (isEditingKey) {
+            metrics.keyCount += 1;
+            if (metrics.keyCount % 10 === 0) persistState();
+          }
         });
       }
 
@@ -815,6 +850,11 @@
         stopSnapshotTimer();
         clearInterval(timerHandle);
         if (storageKey) localStorage.removeItem(storageKey);
+        try {
+          sessionStorage.removeItem('assessmentCandidateToken');
+        } catch (error) {
+          // Session storage may be disabled.
+        }
         els.startView.classList.add('hidden');
         els.assessmentView.classList.add('hidden');
         els.completeView.classList.remove('hidden');
