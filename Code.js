@@ -174,6 +174,8 @@ function setupAssessment() {
   );
 
   ensureSetting_(settings, 'AssessmentTitle', APP.DEFAULT_TITLE);
+  ensureSetting_(settings, 'CompanyName', 'Your Company');
+  ensureSetting_(settings, 'CompanyLogoUrl', '');
   ensureSetting_(settings, 'DurationMinutes', APP.DEFAULT_DURATION_MINUTES);
   ensureSetting_(settings, 'WebAppUrl', 'PASTE_DEPLOYED_WEB_APP_URL_HERE');
   ensureSetting_(settings, 'SourceFormUrl', '');
@@ -226,7 +228,7 @@ function setupAssessment() {
   return [
     'Setup and telemetry upgrade complete.',
     'Existing rows were preserved.',
-    'Review PrivacyNotice, SnapshotIntervalSeconds and StoreSnapshotText in Settings, then deploy a new version of the web app.',
+    'Review CompanyName, CompanyLogoUrl, PrivacyNotice, SnapshotIntervalSeconds and StoreSnapshotText in Settings, then deploy a new version of the web app.',
   ].join('\n');
 }
 
@@ -309,6 +311,9 @@ function doGet(e) {
   const template = HtmlService.createTemplateFromFile('Index');
   template.initialToken = e && e.parameter ? String(e.parameter.token || '') : '';
   template.assessmentTitle = String(settings.AssessmentTitle || APP.DEFAULT_TITLE);
+  template.companyName = String(settings.CompanyName || 'Your Company');
+  const configuredLogoUrl = String(settings.CompanyLogoUrl || '').trim();
+  template.companyLogoUrl = /^https:\/\//i.test(configuredLogoUrl) ? configuredLogoUrl : '';
   template.privacyNotice = String(settings.PrivacyNotice || 'Assessment activity is logged.');
 
   return template
@@ -684,6 +689,11 @@ function validateAssessmentSetup() {
   const candidates = getTable_(APP.SHEETS.CANDIDATES);
 
   if (!settings.AssessmentTitle) problems.push('AssessmentTitle is blank.');
+  if (!String(settings.CompanyName || '').trim()) problems.push('CompanyName is blank.');
+  const companyLogoUrl = String(settings.CompanyLogoUrl || '').trim();
+  if (companyLogoUrl && !/^https:\/\//i.test(companyLogoUrl)) {
+    problems.push('CompanyLogoUrl must be blank or begin with https://.');
+  }
   if (!(Number(settings.DurationMinutes) > 0)) problems.push('DurationMinutes must be greater than zero.');
   const snapshotIntervalSeconds = Number(settings.SnapshotIntervalSeconds);
   if (!(snapshotIntervalSeconds >= 5 && snapshotIntervalSeconds <= 300)) {

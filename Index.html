@@ -40,6 +40,55 @@
         white-space: pre-wrap;
       }
 
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin: -4px 0 28px;
+        padding-bottom: 20px;
+        border-bottom: 1px solid #e8eaed;
+      }
+
+      .company-logo, .company-logo-placeholder {
+        width: 64px;
+        height: 64px;
+        flex: 0 0 64px;
+        border-radius: 12px;
+      }
+
+      .company-logo {
+        display: block;
+        object-fit: contain;
+        background: #fff;
+        border: 1px solid #dadce0;
+        padding: 5px;
+      }
+
+      .company-logo-placeholder {
+        display: grid;
+        place-items: center;
+        color: #fff;
+        background: linear-gradient(135deg, #1a73e8, #174ea6);
+        box-shadow: 0 3px 10px rgba(26, 115, 232, 0.24);
+      }
+
+      .company-logo-placeholder svg { width: 34px; height: 34px; }
+
+      .company-name {
+        color: #202124;
+        font-size: 1.25rem;
+        font-weight: 700;
+        line-height: 1.3;
+      }
+
+      .company-label {
+        color: #5f6368;
+        font-size: 0.82rem;
+        letter-spacing: 0.08em;
+        margin-bottom: 3px;
+        text-transform: uppercase;
+      }
+
       .row {
         display: flex;
         gap: 12px;
@@ -131,6 +180,9 @@
         border-radius: 6px;
       }
 
+      .completion-actions { margin-top: 20px; }
+      .close-hint { color: #5f6368; margin: 12px 0 0; }
+
       .hidden { display: none !important; }
       .word-count { text-align: right; color: #5f6368; font-size: 0.86rem; margin-top: 6px; }
       .required { color: #b3261e; }
@@ -145,6 +197,32 @@
   <body data-initial-token="<?= initialToken ?>">
     <main class="card">
       <section id="startView">
+        <div class="brand" aria-label="Company">
+          <? if (companyLogoUrl) { ?>
+            <img
+              id="companyLogo"
+              class="company-logo"
+              src="<?= companyLogoUrl ?>"
+              alt="<?= companyName ?> logo"
+            >
+            <div id="companyLogoFallback" class="company-logo-placeholder hidden" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 20V8l7-4 7 4v12M9 20v-5h6v5M8 10h1m3 0h1m3 0h1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+          <? } else { ?>
+            <div class="company-logo-placeholder" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 20V8l7-4 7 4v12M9 20v-5h6v5M8 10h1m3 0h1m3 0h1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+          <? } ?>
+          <div>
+            <div class="company-label">Candidate assessment</div>
+            <div class="company-name"><?= companyName ?></div>
+          </div>
+        </div>
+
         <h1><?= assessmentTitle ?></h1>
         <p class="notice"><?= privacyNotice ?></p>
 
@@ -186,6 +264,12 @@
       <section id="completeView" class="hidden">
         <h1>Assessment submitted</h1>
         <p id="completeMessage" class="success"></p>
+        <div class="completion-actions">
+          <button id="closeButton" type="button">Close form</button>
+          <p id="closeHint" class="close-hint hidden" role="status">
+            This browser did not allow the tab to close automatically. You can safely close it now.
+          </p>
+        </div>
       </section>
     </main>
 
@@ -212,7 +296,20 @@
         questionError: document.getElementById('questionError'),
         nextButton: document.getElementById('nextButton'),
         completeMessage: document.getElementById('completeMessage'),
+        closeButton: document.getElementById('closeButton'),
+        closeHint: document.getElementById('closeHint'),
       };
+
+      const companyLogo = document.getElementById('companyLogo');
+      const companyLogoFallback = document.getElementById('companyLogoFallback');
+      if (companyLogo && companyLogoFallback) {
+        const showLogoFallback = () => {
+          companyLogo.classList.add('hidden');
+          companyLogoFallback.classList.remove('hidden');
+        };
+        companyLogo.addEventListener('error', showLogoFallback);
+        if (companyLogo.complete && companyLogo.naturalWidth === 0) showLogoFallback();
+      }
 
       const tokenFromUrl = document.body.dataset.initialToken || '';
       document.body.removeAttribute('data-initial-token');
@@ -253,6 +350,7 @@
 
       els.startButton.addEventListener('click', beginAssessment);
       els.nextButton.addEventListener('click', () => submitCurrent(false));
+      els.closeButton.addEventListener('click', closeForm);
 
       document.addEventListener('visibilitychange', () => {
         if (!assessmentInProgress || !metrics) return;
@@ -859,6 +957,15 @@
         els.assessmentView.classList.add('hidden');
         els.completeView.classList.remove('hidden');
         els.completeMessage.textContent = message;
+      }
+
+      function closeForm() {
+        els.closeButton.disabled = true;
+        window.close();
+        setTimeout(() => {
+          els.closeButton.classList.add('hidden');
+          els.closeHint.classList.remove('hidden');
+        }, 150);
       }
 
       function collectClientInfo() {

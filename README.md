@@ -123,6 +123,8 @@ Run `setupAssessment`. It creates or upgrades:
 Review:
 
 - `AssessmentTitle`
+- `CompanyName`
+- `CompanyLogoUrl`: optional HTTPS URL for the company logo; a built-in placeholder is shown when blank or unavailable.
 - `DurationMinutes`
 - `WebAppUrl`
 - `PrivacyNotice`
@@ -159,6 +161,7 @@ Use a new test token and:
 6. submit and inspect `Responses` and `AnswerSnapshots`.
 
 Confirm that pasted characters and largest insertion increase, snapshots include `interval`, `paste` and `submit`, and the final candidate status is `COMPLETED`.
+Also confirm that the landing-page company branding appears and that the completion page offers a `Close form` button. Browsers that do not permit script-opened tab closure display a safe manual-close message instead.
 
 ## Privacy and interpretation
 
