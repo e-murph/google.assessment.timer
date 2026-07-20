@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <style>
+      :root {
+        font-family: Arial, Helvetica, sans-serif;
+        color: #202124;
+        background: #f5f6f8;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 24px 14px;
+      }
+
+      .card {
+        width: min(780px, 100%);
+        margin: 0 auto;
+        background: #fff;
+        border: 1px solid #dadce0;
+        border-radius: 12px;
+        padding: 28px;
+        box-shadow: 0 2px 8px rgba(60, 64, 67, 0.12);
+      }
+
+      h1 { margin-top: 0; font-size: 1.8rem; }
+      h2 { line-height: 1.4; font-size: 1.25rem; }
+      p { line-height: 1.55; }
+
+      .notice {
+        background: #f8f9fa;
+        border-left: 4px solid #5f6368;
+        padding: 12px 14px;
+        white-space: pre-wrap;
+      }
+
+      .row {
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .meta {
+        color: #5f6368;
+        font-size: 0.92rem;
+      }
+
+      .timer {
+        font-size: 1.1rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .progress {
+        height: 8px;
+        background: #e8eaed;
+        border-radius: 999px;
+        overflow: hidden;
+        margin: 14px 0 24px;
+      }
+
+      .progress > div {
+        height: 100%;
+        background: #1a73e8;
+        width: 0;
+      }
+
+      label { display: block; margin: 12px 0 6px; }
+
+      input[type="text"], textarea {
+        width: 100%;
+        border: 1px solid #9aa0a6;
+        border-radius: 6px;
+        padding: 12px;
+        font: inherit;
+      }
+
+      textarea { resize: vertical; min-height: 190px; }
+
+      input[type="text"]:focus, textarea:focus {
+        outline: 2px solid #1a73e8;
+        outline-offset: 1px;
+      }
+
+      .choice {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        border: 1px solid #dadce0;
+        border-radius: 7px;
+        padding: 11px;
+        margin: 9px 0;
+        cursor: pointer;
+      }
+
+      .choice input { margin-top: 3px; }
+
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 11px 18px;
+        font: inherit;
+        font-weight: 700;
+        background: #1a73e8;
+        color: #fff;
+        cursor: pointer;
+      }
+
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+      .error {
+        color: #b3261e;
+        background: #fce8e6;
+        padding: 10px 12px;
+        border-radius: 6px;
+        margin: 12px 0;
+      }
+
+      .success {
+        color: #137333;
+        background: #e6f4ea;
+        padding: 14px;
+        border-radius: 6px;
+      }
+
+      .hidden { display: none !important; }
+      .word-count { text-align: right; color: #5f6368; font-size: 0.86rem; margin-top: 6px; }
+      .required { color: #b3261e; }
+
+      @media (max-width: 600px) {
+        .card { padding: 20px; }
+        body { padding: 10px; }
+      }
+    </style>
+  </head>
+
+  <body data-initial-token="<?= initialToken ?>">
+    <main class="card">
+      <section id="startView">
+        <h1><?= assessmentTitle ?></h1>
+        <p class="notice"><?= privacyNotice ?></p>
+
+        <div id="tokenArea">
+          <label for="tokenInput">Candidate token</label>
+          <input id="tokenInput" type="text" autocomplete="off" spellcheck="false">
+        </div>
+
+        <label class="choice" for="acknowledge">
+          <input id="acknowledge" type="checkbox">
+          <span>I have read the assessment instructions and the activity-recording notice.</span>
+        </label>
+
+        <div id="startError" class="error hidden" role="alert"></div>
+        <button id="startButton" type="button">Start assessment</button>
+      </section>
+
+      <section id="assessmentView" class="hidden">
+        <div class="row">
+          <div>
+            <div id="candidateLabel" class="meta"></div>
+            <div id="questionNumber" class="meta"></div>
+          </div>
+          <div id="timer" class="timer" aria-live="polite"></div>
+        </div>
+
+        <div class="progress" aria-hidden="true"><div id="progressBar"></div></div>
+        <div id="groupLabel" class="meta"></div>
+        <h2 id="questionText"></h2>
+        <div id="answerArea"></div>
+        <div id="wordCount" class="word-count"></div>
+        <div id="questionError" class="error hidden" role="alert"></div>
+
+        <div class="row" style="margin-top: 24px; justify-content: flex-end;">
+          <button id="nextButton" type="button">Save and continue</button>
+        </div>
+      </section>
+
+      <section id="completeView" class="hidden">
+        <h1>Assessment submitted</h1>
+        <p id="completeMessage" class="success"></p>
+      </section>
+    </main>
+
+    <script>
+      'use strict';
+
+      const els = {
+        startView: document.getElementById('startView'),
+        assessmentView: document.getElementById('assessmentView'),
+        completeView: document.getElementById('completeView'),
+        tokenArea: document.getElementById('tokenArea'),
+        tokenInput: document.getElementById('tokenInput'),
+        acknowledge: document.getElementById('acknowledge'),
+        startButton: document.getElementById('startButton'),
+        startError: document.getElementById('startError'),
+        candidateLabel: document.getElementById('candidateLabel'),
+        questionNumber: document.getElementById('questionNumber'),
+        timer: document.getElementById('timer'),
+        progressBar: document.getElementById('progressBar'),
+        groupLabel: document.getElementById('groupLabel'),
+        questionText: document.getElementById('questionText'),
+        answerArea: document.getElementById('answerArea'),
+        wordCount: document.getElementById('wordCount'),
+        questionError: document.getElementById('questionError'),
+        nextButton: document.getElementById('nextButton'),
+        completeMessage: document.getElementById('completeMessage'),
+      };
+
+      const initialToken = document.body.dataset.initialToken || '';
+      els.tokenInput.value = initialToken;
+      if (initialToken) els.tokenArea.classList.add('hidden');
+
+      let state = null;
+      let metrics = null;
+      let activeSegmentStartedAt = null;
+      let clockOffsetMs = 0;
+      let timerHandle = null;
+      let snapshotTimerHandle = null;
+      let submitting = false;
+      let assessmentInProgress = false;
+      let storageKey = '';
+      let previousAnswer = '';
+      let pendingPasteAt = 0;
+
+      els.startButton.addEventListener('click', beginAssessment);
+      els.nextButton.addEventListener('click', () => submitCurrent(false));
+
+      document.addEventListener('visibilitychange', () => {
+        if (!assessmentInProgress || !metrics) return;
+        if (document.hidden) {
+          stopActiveSegment();
+          metrics.tabLeaveCount += 1;
+          persistState();
+        } else {
+          startActiveSegment();
+        }
+      });
+
+      window.addEventListener('blur', () => {
+        if (!assessmentInProgress || !metrics) return;
+        stopActiveSegment();
+        metrics.blurCount += 1;
+        persistState();
+      });
+
+      window.addEventListener('focus', () => {
+        if (assessmentInProgress) startActiveSegment();
+      });
+
+      window.addEventListener('beforeunload', (event) => {
+        if (!assessmentInProgress || submitting) return;
+        event.preventDefault();
+        event.returnValue = '';
+      });
+
+      function beginAssessment() {
+        hideError(els.startError);
+        const token = els.tokenInput.value.trim();
+
+        if (!token) {
+          showError(els.startError, 'Open the unique candidate link or enter your token.');
+          return;
+        }
+        if (!els.acknowledge.checked) {
+          showError(els.startError, 'Confirm that you have read the instructions and recording notice.');
+          return;
+        }
+
+        els.startButton.disabled = true;
+        google.script.run
+          .withSuccessHandler((result) => {
+            els.startButton.disabled = false;
+            handleServerState(result);
+          })
+          .withFailureHandler((error) => {
+            els.startButton.disabled = false;
+            showError(els.startError, friendlyError(error));
+          })
+          .startAssessment(token, collectClientInfo());
+      }
+
+      function handleServerState(result) {
+        if (!result || !result.ok) {
+          const target = assessmentInProgress ? els.questionError : els.startError;
+          if (assessmentInProgress) {
+            submitting = false;
+            els.nextButton.disabled = false;
+            startActiveSegment();
+            startSnapshotTimer();
+          }
+          showError(target, result && result.message ? result.message : 'The assessment could not be loaded.');
+          return;
+        }
+
+        if (result.completed) {
+          finishAssessment(result.message || 'Your responses have been submitted.');
+          return;
+        }
+
+        const previousStorageKey = storageKey;
+        state = result;
+        clockOffsetMs = Number(result.serverNowMs) - Date.now();
+        storageKey = `assessment:${state.sessionId}:${state.question.id}`;
+
+        if (previousStorageKey && previousStorageKey !== storageKey) {
+          localStorage.removeItem(previousStorageKey);
+        }
+
+        renderQuestion();
+      }
+
+      function renderQuestion() {
+        assessmentInProgress = true;
+        submitting = false;
+        stopSnapshotTimer();
+        activeSegmentStartedAt = null;
+        pendingPasteAt = 0;
+        hideError(els.questionError);
+        els.startView.classList.add('hidden');
+        els.completeView.classList.add('hidden');
+        els.assessmentView.classList.remove('hidden');
+
+        els.candidateLabel.textContent = state.candidateName
+          ? `Candidate: ${state.candidateName}`
+          : 'Candidate assessment';
+        els.questionNumber.textContent = `Question ${state.currentNumber} of ${state.totalQuestions}`;
+        els.progressBar.style.width = `${(state.currentNumber / state.totalQuestions) * 100}%`;
+        els.groupLabel.textContent = state.question.groupId ? `Group: ${state.question.groupId}` : '';
+        els.questionText.textContent = state.question.text;
+
+        metrics = loadStoredState();
+        const wasRestored = Boolean(metrics.answer || metrics.snapshots.length);
+        buildAnswerControl();
+        previousAnswer = readAnswer();
+        updateWordCount();
+        startActiveSegment();
+        startOverallTimer();
+        startSnapshotTimer();
+        captureSnapshot(wasRestored ? 'restored' : 'question_shown', true);
+
+        els.nextButton.textContent =
+          state.currentNumber === state.totalQuestions ? 'Submit assessment' : 'Save and continue';
+        els.nextButton.disabled = false;
+      }
+
+      function loadStoredState() {
+        const defaults = {
+          answer: '',
+          activeMs: 0,
+          firstInteractionMs: null,
+          pasteCount: 0,
+          tabLeaveCount: 0,
+          blurCount: 0,
+          keyCount: 0,
+          typedCharacters: 0,
+          pastedCharacters: 0,
+          largestInsertionCharacters: 0,
+          deletedCharacters: 0,
+          deletionEvents: 0,
+          revisionEvents: 0,
+          undoCount: 0,
+          redoCount: 0,
+          lastEditMs: null,
+          snapshots: [],
+        };
+
+        try {
+          const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+          if (!saved || typeof saved !== 'object') return defaults;
+          const merged = { ...defaults, ...saved };
+          merged.snapshots = Array.isArray(saved.snapshots) ? saved.snapshots : [];
+          return merged;
+        } catch (error) {
+          return defaults;
+        }
+      }
+
+      function buildAnswerControl() {
+        els.answerArea.replaceChildren();
+        const type = state.question.answerType;
+
+        if (type === 'multiple_choice') {
+          state.question.options.forEach((option, index) => {
+            const label = document.createElement('label');
+            label.className = 'choice';
+
+            const radio = document.createElement('input');
+            radio.type = 'radio';
+            radio.name = 'answer';
+            radio.value = option;
+            radio.id = `choice_${index}`;
+            radio.checked = metrics.answer === option;
+
+            const text = document.createElement('span');
+            text.textContent = option;
+
+            attachChoiceEvents(radio);
+            label.append(radio, text);
+            els.answerArea.appendChild(label);
+          });
+          return;
+        }
+
+        const input = type === 'short_text'
+          ? document.createElement('input')
+          : document.createElement('textarea');
+
+        if (type === 'short_text') {
+          input.type = 'text';
+        } else {
+          input.rows = 10;
+        }
+
+        input.id = 'answerInput';
+        input.value = metrics.answer || '';
+        input.autocomplete = 'off';
+        input.spellcheck = true;
+        input.setAttribute('aria-label', 'Your answer');
+        attachTextEvents(input);
+        els.answerArea.appendChild(input);
+        input.focus();
+      }
+
+      function attachChoiceEvents(input) {
+        input.addEventListener('change', () => {
+          markFirstInteraction();
+          const answer = readAnswer();
+          if (answer !== previousAnswer) {
+            metrics.revisionEvents += 1;
+            metrics.lastEditMs = elapsedSinceQuestionShown();
+            previousAnswer = answer;
+          }
+          metrics.answer = answer;
+          updateWordCount();
+          persistState();
+        });
+      }
+
+      function attachTextEvents(input) {
+        input.addEventListener('input', (event) => {
+          markFirstInteraction();
+          const answer = input.value;
+          const delta = calculateTextDelta(previousAnswer, answer);
+          const inputType = String(event.inputType || '');
+          const isUndo = inputType === 'historyUndo';
+          const isRedo = inputType === 'historyRedo';
+          const isPasteLike =
+            inputType === 'insertFromPaste' ||
+            inputType === 'insertFromDrop' ||
+            (pendingPasteAt > 0 && Date.now() - pendingPasteAt < 2000);
+
+          if (answer !== previousAnswer) {
+            metrics.revisionEvents += 1;
+            metrics.lastEditMs = elapsedSinceQuestionShown();
+
+            if (delta.deletedCharacters > 0) {
+              metrics.deletedCharacters += delta.deletedCharacters;
+              metrics.deletionEvents += 1;
+            }
+
+            if (delta.insertedCharacters > 0) {
+              metrics.largestInsertionCharacters = Math.max(
+                metrics.largestInsertionCharacters,
+                delta.insertedCharacters
+              );
+
+              if (isPasteLike) {
+                metrics.pastedCharacters += delta.insertedCharacters;
+              } else if (!isUndo && !isRedo) {
+                metrics.typedCharacters += delta.insertedCharacters;
+              }
+            }
+
+            if (isUndo) metrics.undoCount += 1;
+            if (isRedo) metrics.redoCount += 1;
+          }
+
+          pendingPasteAt = 0;
+          previousAnswer = answer;
+          metrics.answer = answer;
+          updateWordCount();
+          persistState();
+        });
+
+        input.addEventListener('paste', () => {
+          markFirstInteraction();
+          metrics.pasteCount += 1;
+          pendingPasteAt = Date.now();
+          persistState();
+          setTimeout(() => captureSnapshot('paste', true), 0);
+        });
+
+        input.addEventListener('keydown', () => {
+          markFirstInteraction();
+          metrics.keyCount += 1;
+          if (metrics.keyCount % 10 === 0) persistState();
+        });
+      }
+
+      function calculateTextDelta(previousText, nextText) {
+        const previous = String(previousText || '');
+        const next = String(nextText || '');
+        let prefixLength = 0;
+        const sharedLength = Math.min(previous.length, next.length);
+
+        while (
+          prefixLength < sharedLength &&
+          previous.charCodeAt(prefixLength) === next.charCodeAt(prefixLength)
+        ) {
+          prefixLength += 1;
+        }
+
+        let suffixLength = 0;
+        while (
+          suffixLength < previous.length - prefixLength &&
+          suffixLength < next.length - prefixLength &&
+          previous.charCodeAt(previous.length - 1 - suffixLength) ===
+            next.charCodeAt(next.length - 1 - suffixLength)
+        ) {
+          suffixLength += 1;
+        }
+
+        return {
+          insertedCharacters: Math.max(0, next.length - prefixLength - suffixLength),
+          deletedCharacters: Math.max(0, previous.length - prefixLength - suffixLength),
+        };
+      }
+
+      function elapsedSinceQuestionShown() {
+        return Math.max(0, correctedNow() - Number(state.questionShownAtMs));
+      }
+
+      function markFirstInteraction() {
+        if (metrics.firstInteractionMs != null) return;
+        metrics.firstInteractionMs = Math.max(0, correctedNow() - Number(state.questionShownAtMs));
+      }
+
+      function readAnswer() {
+        if (state.question.answerType === 'multiple_choice') {
+          const checked = document.querySelector('input[name="answer"]:checked');
+          return checked ? checked.value : '';
+        }
+        const input = document.getElementById('answerInput');
+        return input ? input.value : '';
+      }
+
+      function updateWordCount() {
+        const answer = readAnswer();
+        metrics.answer = answer;
+        const words = countWords(answer);
+        if (state.question.maxWords) {
+          els.wordCount.textContent = `${words} / ${state.question.maxWords} words`;
+        } else {
+          els.wordCount.textContent = answer ? `${words} words` : '';
+        }
+      }
+
+      function submitCurrent(forceComplete) {
+        if (!state || submitting) return;
+        hideError(els.questionError);
+
+        const answer = readAnswer().trim();
+        const wordCount = countWords(answer);
+
+        if (!forceComplete) {
+          if (state.question.required && !answer) {
+            showError(els.questionError, 'An answer is required before continuing.');
+            return;
+          }
+          if (state.question.maxWords && wordCount > state.question.maxWords) {
+            showError(
+              els.questionError,
+              `This answer is ${wordCount} words. The maximum is ${state.question.maxWords}.`
+            );
+            return;
+          }
+        }
+
+        captureSnapshot('submit', true);
+        stopSnapshotTimer();
+        metrics.answer = answer;
+        stopActiveSegment();
+        persistState();
+        submitting = true;
+        els.nextButton.disabled = true;
+
+        const payload = {
+          sessionId: state.sessionId,
+          questionId: state.question.id,
+          answer,
+          activeMs: metrics.activeMs,
+          firstInteractionMs: metrics.firstInteractionMs,
+          pasteCount: metrics.pasteCount,
+          tabLeaveCount: metrics.tabLeaveCount,
+          blurCount: metrics.blurCount,
+          keyCount: metrics.keyCount,
+          typedCharacters: metrics.typedCharacters,
+          pastedCharacters: metrics.pastedCharacters,
+          largestInsertionCharacters: metrics.largestInsertionCharacters,
+          deletedCharacters: metrics.deletedCharacters,
+          deletionEvents: metrics.deletionEvents,
+          revisionEvents: metrics.revisionEvents,
+          undoCount: metrics.undoCount,
+          redoCount: metrics.redoCount,
+          lastEditMs: metrics.lastEditMs,
+          snapshots: metrics.snapshots,
+          forceComplete: Boolean(forceComplete),
+        };
+
+        google.script.run
+          .withSuccessHandler((result) => {
+            submitting = false;
+            handleServerState(result);
+          })
+          .withFailureHandler((error) => {
+            submitting = false;
+            els.nextButton.disabled = false;
+            startActiveSegment();
+            startSnapshotTimer();
+            showError(els.questionError, friendlyError(error));
+          })
+          .saveAndNext(payload);
+      }
+
+      function startActiveSegment() {
+        if (!assessmentInProgress || !metrics) return;
+        if (document.hidden || !document.hasFocus()) return;
+        if (activeSegmentStartedAt == null) activeSegmentStartedAt = Date.now();
+      }
+
+      function stopActiveSegment() {
+        if (activeSegmentStartedAt == null || !metrics) return;
+        metrics.activeMs += Math.max(0, Date.now() - activeSegmentStartedAt);
+        activeSegmentStartedAt = null;
+      }
+
+      function persistState() {
+        if (!storageKey || !metrics) return;
+        const snapshot = {
+          ...metrics,
+          activeMs:
+            metrics.activeMs +
+            (activeSegmentStartedAt == null ? 0 : Math.max(0, Date.now() - activeSegmentStartedAt)),
+        };
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(snapshot));
+        } catch (error) {
+          // Local storage may be blocked. Server-side elapsed timing still works.
+        }
+      }
+
+      function currentActiveMs() {
+        return (
+          metrics.activeMs +
+          (activeSegmentStartedAt == null ? 0 : Math.max(0, Date.now() - activeSegmentStartedAt))
+        );
+      }
+
+      function startSnapshotTimer() {
+        stopSnapshotTimer();
+        if (!assessmentInProgress || !state || !metrics || submitting) return;
+        const intervalSeconds = Math.min(
+          300,
+          Math.max(5, Number(state.snapshotIntervalSeconds) || 15)
+        );
+        snapshotTimerHandle = setInterval(
+          () => captureSnapshot('interval', false),
+          intervalSeconds * 1000
+        );
+      }
+
+      function stopSnapshotTimer() {
+        if (snapshotTimerHandle != null) {
+          clearInterval(snapshotTimerHandle);
+          snapshotTimerHandle = null;
+        }
+      }
+
+      function captureSnapshot(reason, force) {
+        if (!assessmentInProgress || !state || !metrics) return;
+        if (metrics.snapshots.length >= 250) return;
+
+        const capturedMs = elapsedSinceQuestionShown();
+        const lastSnapshot = metrics.snapshots[metrics.snapshots.length - 1];
+        if (
+          !force &&
+          lastSnapshot &&
+          capturedMs - Number(lastSnapshot.capturedMs || 0) < 1000
+        ) {
+          return;
+        }
+
+        const answer = readAnswer();
+        metrics.answer = answer;
+        metrics.snapshots.push({
+          reason,
+          capturedMs,
+          activeMs: currentActiveMs(),
+          answerCharacters: answer.length,
+          answerWords: countWords(answer),
+          typedCharacters: metrics.typedCharacters,
+          pastedCharacters: metrics.pastedCharacters,
+          largestInsertionCharacters: metrics.largestInsertionCharacters,
+          deletedCharacters: metrics.deletedCharacters,
+          revisionEvents: metrics.revisionEvents,
+          pasteCount: metrics.pasteCount,
+          tabLeaveCount: metrics.tabLeaveCount,
+          blurCount: metrics.blurCount,
+          answerSnapshot: state.storeSnapshotText ? answer.slice(0, 20000) : '',
+          snapshotTextTruncated: state.storeSnapshotText && answer.length > 20000,
+        });
+        persistState();
+      }
+
+      function startOverallTimer() {
+        clearInterval(timerHandle);
+        updateTimer();
+        timerHandle = setInterval(updateTimer, 1000);
+      }
+
+      function updateTimer() {
+        if (!state || submitting) return;
+        const remainingMs = Number(state.deadlineAtMs) - correctedNow();
+        els.timer.textContent = `Time remaining: ${formatDuration(Math.max(0, remainingMs))}`;
+
+        if (remainingMs <= 0) {
+          clearInterval(timerHandle);
+          submitCurrent(true);
+        }
+      }
+
+      function correctedNow() {
+        return Date.now() + clockOffsetMs;
+      }
+
+      function finishAssessment(message) {
+        assessmentInProgress = false;
+        submitting = false;
+        stopActiveSegment();
+        stopSnapshotTimer();
+        clearInterval(timerHandle);
+        if (storageKey) localStorage.removeItem(storageKey);
+        els.startView.classList.add('hidden');
+        els.assessmentView.classList.add('hidden');
+        els.completeView.classList.remove('hidden');
+        els.completeMessage.textContent = message;
+      }
+
+      function collectClientInfo() {
+        return {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          platform: navigator.platform,
+          screenWidth: window.screen.width,
+          screenHeight: window.screen.height,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        };
+      }
+
+      function countWords(text) {
+        const trimmed = String(text || '').trim();
+        return trimmed ? trimmed.split(/\s+/).length : 0;
+      }
+
+      function formatDuration(milliseconds) {
+        const totalSeconds = Math.ceil(milliseconds / 1000);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        return hours > 0
+          ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+          : `${minutes}:${String(seconds).padStart(2, '0')}`;
+      }
+
+      function showError(element, message) {
+        element.textContent = message;
+        element.classList.remove('hidden');
+      }
+
+      function hideError(element) {
+        element.textContent = '';
+        element.classList.add('hidden');
+      }
+
+      function friendlyError(error) {
+        return error && error.message
+          ? error.message
+          : 'A connection error occurred. Check your internet connection and try again.';
+      }
+    </script>
+  </body>
+</html>
