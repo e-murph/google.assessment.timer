@@ -186,6 +186,7 @@
       .hidden { display: none !important; }
       .word-count { text-align: right; color: #5f6368; font-size: 0.86rem; margin-top: 6px; }
       .required { color: #b3261e; }
+      .save-status { color: #5f6368; font-size: 0.86rem; min-height: 1.2em; text-align: right; }
 
       @media (max-width: 600px) {
         .card { padding: 20px; }
@@ -204,6 +205,8 @@
               class="company-logo"
               src="<?= companyLogoUrl ?>"
               alt="<?= companyName ?> logo"
+              referrerpolicy="no-referrer"
+              decoding="async"
             >
             <div id="companyLogoFallback" class="company-logo-placeholder hidden" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -254,6 +257,7 @@
         <h2 id="questionText"></h2>
         <div id="answerArea"></div>
         <div id="wordCount" class="word-count"></div>
+        <div id="saveStatus" class="save-status" role="status" aria-live="polite"></div>
         <div id="questionError" class="error hidden" role="alert"></div>
 
         <div class="row" style="margin-top: 24px; justify-content: flex-end;">
@@ -293,6 +297,7 @@
         questionText: document.getElementById('questionText'),
         answerArea: document.getElementById('answerArea'),
         wordCount: document.getElementById('wordCount'),
+        saveStatus: document.getElementById('saveStatus'),
         questionError: document.getElementById('questionError'),
         nextButton: document.getElementById('nextButton'),
         completeMessage: document.getElementById('completeMessage'),
@@ -347,6 +352,8 @@
       let previousAnswer = '';
       let pendingPasteAt = 0;
       let snapshotFlushInProgress = false;
+
+      cleanupLocalDrafts();
 
       els.startButton.addEventListener('click', beginAssessment);
       els.nextButton.addEventListener('click', () => submitCurrent(false));
@@ -404,13 +411,16 @@
         }
 
         els.startButton.disabled = true;
+        els.startButton.textContent = 'Starting…';
         google.script.run
           .withSuccessHandler((result) => {
             els.startButton.disabled = false;
+            els.startButton.textContent = 'Start assessment';
             handleServerState(result);
           })
           .withFailureHandler((error) => {
             els.startButton.disabled = false;
+            els.startButton.textContent = 'Start assessment';
             showError(els.startError, friendlyError(error));
           })
           .startAssessment(token, collectClientInfo());
@@ -422,6 +432,8 @@
           if (assessmentInProgress) {
             submitting = false;
             els.nextButton.disabled = false;
+            updateNextButtonLabel();
+            els.nextButton.removeAttribute('aria-busy');
             startActiveSegment();
             startSnapshotTimer();
           }
@@ -440,7 +452,11 @@
         storageKey = `assessment:${state.sessionId}:${state.question.id}`;
 
         if (previousStorageKey && previousStorageKey !== storageKey) {
-          localStorage.removeItem(previousStorageKey);
+          try {
+            localStorage.removeItem(previousStorageKey);
+          } catch (error) {
+            // Local storage may be disabled.
+          }
         }
 
         renderQuestion();
@@ -463,7 +479,15 @@
         els.questionNumber.textContent = `Question ${state.currentNumber} of ${state.totalQuestions}`;
         els.progressBar.style.width = `${(state.currentNumber / state.totalQuestions) * 100}%`;
         els.groupLabel.textContent = state.question.groupId ? `Group: ${state.question.groupId}` : '';
-        els.questionText.textContent = state.question.text;
+        els.questionText.replaceChildren(document.createTextNode(state.question.text));
+        if (state.question.required) {
+          const requiredMarker = document.createElement('span');
+          requiredMarker.className = 'required';
+          requiredMarker.textContent = ' *';
+          requiredMarker.title = 'Required';
+          requiredMarker.setAttribute('aria-label', ' required');
+          els.questionText.appendChild(requiredMarker);
+        }
 
         metrics = loadStoredState();
         const wasRestored = Boolean(metrics.answer || metrics.snapshots.length);
@@ -476,9 +500,10 @@
         startSnapshotTimer();
         flushProgress();
 
-        els.nextButton.textContent =
-          state.currentNumber === state.totalQuestions ? 'Submit assessment' : 'Save and continue';
+        updateNextButtonLabel();
         els.nextButton.disabled = false;
+        els.nextButton.removeAttribute('aria-busy');
+        setSaveStatus(wasRestored ? 'Draft restored from this device.' : 'Draft saved on this device.');
       }
 
       function loadStoredState() {
@@ -507,6 +532,10 @@
         try {
           const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
           if (!saved || typeof saved !== 'object') return defaults;
+          if (Number(saved.expiresAtMs) && Number(saved.expiresAtMs) <= Date.now()) {
+            localStorage.removeItem(storageKey);
+            return defaults;
+          }
           const merged = { ...defaults, ...saved };
           merged.snapshots = Array.isArray(saved.snapshots) ? saved.snapshots : [];
           merged.snapshotSequence = Math.max(
@@ -558,6 +587,7 @@
 
         input.id = 'answerInput';
         input.value = metrics.answer || '';
+        input.maxLength = Math.max(1, Number(state.maxAnswerCharacters) || 40000);
         input.autocomplete = 'off';
         input.spellcheck = true;
         input.setAttribute('aria-label', 'Your answer');
@@ -700,10 +730,11 @@
         const answer = readAnswer();
         metrics.answer = answer;
         const words = countWords(answer);
+        const characterCount = `${answer.length} / ${Number(state.maxAnswerCharacters) || 40000} characters`;
         if (state.question.maxWords) {
-          els.wordCount.textContent = `${words} / ${state.question.maxWords} words`;
+          els.wordCount.textContent = `${words} / ${state.question.maxWords} words · ${characterCount}`;
         } else {
-          els.wordCount.textContent = answer ? `${words} words` : '';
+          els.wordCount.textContent = answer ? `${words} words · ${characterCount}` : characterCount;
         }
       }
 
@@ -713,6 +744,15 @@
 
         const answer = readAnswer().trim();
         const wordCount = countWords(answer);
+        const maxAnswerCharacters = Math.max(1, Number(state.maxAnswerCharacters) || 40000);
+
+        if (answer.length > maxAnswerCharacters) {
+          showError(
+            els.questionError,
+            `This answer is ${answer.length} characters. The maximum is ${maxAnswerCharacters}.`
+          );
+          return;
+        }
 
         if (!forceComplete) {
           if (state.question.required && !answer) {
@@ -735,9 +775,13 @@
         persistState();
         submitting = true;
         els.nextButton.disabled = true;
+        els.nextButton.textContent = 'Saving…';
+        els.nextButton.setAttribute('aria-busy', 'true');
+        setSaveStatus('Saving your answer…');
 
         const payload = {
           sessionId: state.sessionId,
+          sessionNonce: state.sessionNonce || '',
           questionId: state.question.id,
           submissionId: metrics.submissionId,
           answer,
@@ -768,8 +812,11 @@
           .withFailureHandler((error) => {
             submitting = false;
             els.nextButton.disabled = false;
+            updateNextButtonLabel();
+            els.nextButton.removeAttribute('aria-busy');
             startActiveSegment();
             startSnapshotTimer();
+            setSaveStatus('Your answer is still saved on this device.');
             showError(els.questionError, friendlyError(error));
           })
           .saveAndNext(payload);
@@ -789,14 +836,18 @@
 
       function persistState() {
         if (!storageKey || !metrics) return;
+        const retentionMs = Math.max(1, Number(state.draftRetentionHours) || 24) * 60 * 60 * 1000;
         const snapshot = {
           ...metrics,
+          savedAtMs: Date.now(),
+          expiresAtMs: Date.now() + retentionMs,
           activeMs:
             metrics.activeMs +
             (activeSegmentStartedAt == null ? 0 : Math.max(0, Date.now() - activeSegmentStartedAt)),
         };
         try {
           localStorage.setItem(storageKey, JSON.stringify(snapshot));
+          setSaveStatus('Draft saved on this device.');
         } catch (error) {
           // Local storage may be blocked. Server-side elapsed timing still works.
         }
@@ -834,7 +885,13 @@
 
       function captureSnapshot(reason, force) {
         if (!assessmentInProgress || !state || !metrics) return;
-        if (metrics.snapshotSequence >= 250) return;
+        const maximumSnapshots = Math.min(
+          1000,
+          Math.max(50, Number(state.maxSnapshotsPerQuestion) || 250)
+        );
+        const reservedImportantSnapshots = Math.min(10, maximumSnapshots);
+        if (metrics.snapshotSequence >= maximumSnapshots) return;
+        if (!force && metrics.snapshotSequence >= maximumSnapshots - reservedImportantSnapshots) return;
 
         const capturedMs = elapsedSinceQuestionShown();
         const lastSnapshot = metrics.snapshots[metrics.snapshots.length - 1];
@@ -885,26 +942,47 @@
 
         const snapshotsToSave = metrics.snapshots.slice();
         const sentIds = new Set(snapshotsToSave.map((snapshot) => snapshot.snapshotId));
+        const requestMetrics = metrics;
+        const requestStorageKey = storageKey;
+        const requestSessionId = state.sessionId;
+        const requestQuestionId = state.question.id;
         snapshotFlushInProgress = true;
+        setSaveStatus('Saving progress…');
 
         google.script.run
           .withSuccessHandler((result) => {
             snapshotFlushInProgress = false;
+            if (
+              metrics !== requestMetrics ||
+              storageKey !== requestStorageKey ||
+              !state ||
+              state.sessionId !== requestSessionId ||
+              state.question.id !== requestQuestionId
+            ) return;
             if (result && result.ok) {
               const savedIds = new Set(result.savedSnapshotIds || []);
               metrics.snapshots = metrics.snapshots.filter(
                 (snapshot) => !sentIds.has(snapshot.snapshotId) || !savedIds.has(snapshot.snapshotId)
               );
               persistState();
+              setSaveStatus(`Progress saved at ${new Date().toLocaleTimeString([], {
+                hour: '2-digit', minute: '2-digit',
+              })}.`);
+            } else {
+              setSaveStatus('Progress is saved on this device and will be retried.');
             }
           })
           .withFailureHandler(() => {
             snapshotFlushInProgress = false;
+            if (metrics === requestMetrics && storageKey === requestStorageKey) {
+              setSaveStatus('Progress is saved on this device and will be retried.');
+            }
             // Pending snapshots remain in local storage and are retried later
             // or included with the final answer submission.
           })
           .saveProgress({
             sessionId: state.sessionId,
+            sessionNonce: state.sessionNonce || '',
             questionId: state.question.id,
             submissionId: metrics.submissionId,
             snapshots: snapshotsToSave,
@@ -947,7 +1025,7 @@
         stopActiveSegment();
         stopSnapshotTimer();
         clearInterval(timerHandle);
-        if (storageKey) localStorage.removeItem(storageKey);
+        removeSessionDrafts(state && state.sessionId ? state.sessionId : '');
         try {
           sessionStorage.removeItem('assessmentCandidateToken');
         } catch (error) {
@@ -972,7 +1050,10 @@
         return {
           userAgent: navigator.userAgent,
           language: navigator.language,
-          platform: navigator.platform,
+          clientPlatform:
+            navigator.userAgentData && navigator.userAgentData.platform
+              ? navigator.userAgentData.platform
+              : '',
           screenWidth: window.screen.width,
           screenHeight: window.screen.height,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -982,6 +1063,56 @@
       function countWords(text) {
         const trimmed = String(text || '').trim();
         return trimmed ? trimmed.split(/\s+/).length : 0;
+      }
+
+      function updateNextButtonLabel() {
+        if (!state) return;
+        els.nextButton.textContent =
+          state.currentNumber === state.totalQuestions ? 'Submit assessment' : 'Save and continue';
+      }
+
+      function setSaveStatus(message) {
+        els.saveStatus.textContent = String(message || '');
+      }
+
+      function cleanupLocalDrafts() {
+        const now = Date.now();
+        const fallbackExpiryMs = 24 * 60 * 60 * 1000;
+        try {
+          for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+            const key = localStorage.key(index);
+            if (!key || !key.startsWith('assessment:')) continue;
+            try {
+              const saved = JSON.parse(localStorage.getItem(key) || 'null');
+              if (!saved || typeof saved !== 'object') {
+                localStorage.removeItem(key);
+              } else if (Number(saved.expiresAtMs) && Number(saved.expiresAtMs) <= now) {
+                localStorage.removeItem(key);
+              } else if (!Number(saved.expiresAtMs)) {
+                saved.savedAtMs = Number(saved.savedAtMs) || now;
+                saved.expiresAtMs = saved.savedAtMs + fallbackExpiryMs;
+                localStorage.setItem(key, JSON.stringify(saved));
+              }
+            } catch (error) {
+              localStorage.removeItem(key);
+            }
+          }
+        } catch (error) {
+          // Local storage may be disabled.
+        }
+      }
+
+      function removeSessionDrafts(sessionId) {
+        if (!sessionId) return;
+        const prefix = `assessment:${sessionId}:`;
+        try {
+          for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+            const key = localStorage.key(index);
+            if (key && key.startsWith(prefix)) localStorage.removeItem(key);
+          }
+        } catch (error) {
+          // Local storage may be disabled.
+        }
       }
 
       function formatDuration(milliseconds) {

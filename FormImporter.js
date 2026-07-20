@@ -12,6 +12,7 @@
  * Google Form, and its existing responses.
  */
 function importQuestionsFromExistingForm() {
+  assertAdministrator_();
   const settings = getSettings_();
   const sourceFormUrl = String(settings.SourceFormUrl || '').trim();
 
@@ -145,6 +146,7 @@ function importQuestionsFromExistingForm() {
       Options: imported.options.map(cleanImportedOption_).join('|'),
       Required: imported.required,
       MaxWords: '',
+      Active: true,
     });
 
     logRows.push([
@@ -166,17 +168,17 @@ function importQuestionsFromExistingForm() {
 
   let addedCount = 0;
   let updatedCount = 0;
+  let archivedCount = 0;
   try {
     const ss = getSpreadsheet_();
     const table = getTable_(APP.SHEETS.QUESTIONS);
-    const mergedRows = table.rows.map((row) => row.slice());
     const rowIndexByQuestionId = {};
-    const importOrderBase = mergedRows.reduce((maximum, row) => {
+    let nextOrder = table.rows.reduce((maximum, row) => {
       const order = Number(row[table.map.Order]);
       return Number.isFinite(order) ? Math.max(maximum, order) : maximum;
     }, 0);
 
-    mergedRows.forEach((row, index) => {
+    table.rows.forEach((row, index) => {
       const questionId = String(row[table.map.QuestionID] || '').trim();
       if (!questionId) return;
       if (questionId in rowIndexByQuestionId) {
@@ -187,55 +189,70 @@ function importQuestionsFromExistingForm() {
       rowIndexByQuestionId[questionId] = index;
     });
 
+    const importedQuestionIds = new Set(rows.map((row) => row.QuestionID));
     rows.forEach((valuesByHeader) => {
-      valuesByHeader.Order = importOrderBase + valuesByHeader.Order;
       const questionId = valuesByHeader.QuestionID;
       const existingIndex = rowIndexByQuestionId[questionId];
-      const row = existingIndex == null
-        ? Array(table.headers.length).fill('')
-        : mergedRows[existingIndex].slice();
-
+      const updates = {};
       Object.keys(valuesByHeader).forEach((header) => {
         if (!(header in table.map)) {
           throw new Error(`Questions is missing ${header}. Run setupAssessment.`);
         }
         const value = valuesByHeader[header];
         if (existingIndex != null && header === 'MaxWords' && value === '') return;
-        row[table.map[header]] = typeof value === 'string' ? safeForSheet_(value) : value;
+        if (existingIndex != null && header === 'Order') return;
+        updates[header] = typeof value === 'string' ? safeForSheet_(value) : value;
       });
 
       if (existingIndex == null) {
-        rowIndexByQuestionId[questionId] = mergedRows.length;
-        mergedRows.push(row);
+        nextOrder += 1;
+        updates.Order = nextOrder;
+        appendMappedRowToSheet_(table.sheet, updates);
         addedCount += 1;
       } else {
-        mergedRows[existingIndex] = row;
+        const existingOrder = Number(table.rows[existingIndex][table.map.Order]);
+        if (!(Number.isFinite(existingOrder) && existingOrder > 0)) {
+          nextOrder += 1;
+          updates.Order = nextOrder;
+        }
+        setMappedValuesInRow_(table, existingIndex + 2, updates);
         updatedCount += 1;
       }
     });
 
-    table.sheet
-      .getRange(2, 1, mergedRows.length, table.headers.length)
-      .setValues(mergedRows);
-    table.sheet.autoResizeColumns(1, table.headers.length);
+    // Keep historical rows but remove source questions that no longer exist
+    // from future assessments. Existing sessions retain their frozen questions.
+    table.rows.forEach((row, index) => {
+      const questionId = String(row[table.map.QuestionID] || '').trim();
+      if (!questionId.startsWith('GF_') || importedQuestionIds.has(questionId)) return;
+      if (String(row[table.map.Active] || '').trim().toLowerCase() === 'false') return;
+      setMappedValuesInRow_(table, index + 2, { Active: false });
+      archivedCount += 1;
+    });
 
     const logSheetName = 'ImportLog';
     const logSheet = ss.getSheetByName(logSheetName) || ss.insertSheet(logSheetName);
     const logStartRow = logSheet.getLastRow() > 0 ? logSheet.getLastRow() + 2 : 1;
+    const safeLogRows = logRows.map((row) => row.map((value) =>
+      typeof value === 'string' ? safeForSheet_(value) : value
+    ));
     logSheet
-      .getRange(logStartRow, 1, logRows.length, logRows[0].length)
-      .setValues(logRows);
+      .getRange(logStartRow, 1, safeLogRows.length, safeLogRows[0].length)
+      .setValues(safeLogRows);
     logSheet.setFrozenRows(1);
     logSheet.autoResizeColumns(1, logRows[0].length);
 
-    updateSettingValue_('AssessmentTitle', form.getTitle());
+    if (!String(settings.AssessmentTitle || '').trim()) {
+      updateSettingValue_('AssessmentTitle', form.getTitle());
+    }
   } finally {
-    lock.releaseLock();
+    flushAndReleaseLock_(lock);
   }
 
   return [
     `Imported ${rows.length} questions from “${form.getTitle()}”.`,
     `Added ${addedCount} questions and updated ${updatedCount} existing imported questions.`,
+    `Archived ${archivedCount} previously imported questions that are no longer in the Form.`,
     `Reviewed ${items.length} total form items. Existing unrelated questions and prior ImportLog entries were preserved.`,
     'Open the ImportLog sheet to review skipped or converted items.',
   ].join('\n');
@@ -276,11 +293,12 @@ function unsupportedTypeNote_(typeName) {
 
 function updateSettingValue_(key, value) {
   const table = getTable_(APP.SHEETS.SETTINGS);
+  const storedValue = typeof value === 'string' ? safeForSheet_(value) : value;
   for (let index = 0; index < table.rows.length; index += 1) {
     if (String(table.rows[index][table.map.Key] || '').trim() === key) {
-      table.sheet.getRange(index + 2, table.map.Value + 1).setValue(value);
+      table.sheet.getRange(index + 2, table.map.Value + 1).setValue(storedValue);
       return;
     }
   }
-  table.sheet.appendRow([key, value]);
+  appendMappedRowToSheet_(table.sheet, { Key: key, Value: storedValue });
 }

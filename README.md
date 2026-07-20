@@ -26,6 +26,9 @@ It does not prove that AI was used. Treat all activity data as review indicators
 
 This version upgrades the earlier timer package without clearing existing data.
 
+Before upgrading, make a copy of the spreadsheet. The setup routine is
+non-destructive, but a backup is recommended before every production migration.
+
 1. Open the Google Sheet that contains the assessment.
 2. Select **Extensions > Apps Script**.
 3. Replace the complete contents of the existing Apps Script `Code.gs` with this package's `Code.js`.
@@ -35,20 +38,26 @@ This version upgrades the earlier timer package without clearing existing data.
 7. Run `setupAssessment` once from the Apps Script editor.
 8. Return to the spreadsheet and confirm that:
    - `AnswerSnapshots` and `SessionQuestions` tabs exist;
+   - `Active` was appended to `Questions` and `SessionNonce` was appended to `Sessions`;
    - new identifier and telemetry-interpretation columns were appended to `Responses`, `Sessions`, and `AnswerSnapshots`;
-   - `SnapshotIntervalSeconds`, `StoreSnapshotText`, and `TelemetryInterpretation` were added to `Settings`.
+   - `CompanyName`, `CompanyLogoUrl`, `SnapshotIntervalSeconds`, `StoreSnapshotText`, `MaxAnswerCharacters`, `DeadlineGraceSeconds`, `DraftRetentionHours`, `MaxSnapshotsPerQuestion`, and `TelemetryInterpretation` exist in `Settings`.
 9. Review and update your existing `PrivacyNotice`. The upgrade deliberately does not overwrite a notice that you have already customised.
 10. Select **Deploy > Manage deployments**, edit the current web-app deployment, choose **New version**, and deploy it.
-11. Test with a fresh candidate token.
+11. Test one existing token and one fresh candidate token. Mixed-case legacy tokens remain case-sensitive.
+12. If the deployed `/exec` URL changed, update `WebAppUrl` and rerun `generateCandidateTokens` to refresh links. Existing tokens themselves are not replaced.
 
-Running `setupAssessment` preserves existing imported questions, candidates, sessions and responses. It appends missing sheets, columns and settings.
+Running `setupAssessment` preserves existing imported questions, candidates, sessions and responses. It appends missing sheets, columns and settings. It also freezes the currently available questions for legacy in-progress sessions that predate `SessionQuestions`, preventing later imports from changing those attempts.
 
-## New settings
+## Settings added by the upgrade
 
 The following settings control snapshots:
 
 - `SnapshotIntervalSeconds`: frequency of periodic snapshots. Default: `15`. Supported range: 5–300 seconds.
 - `StoreSnapshotText`: `TRUE` stores the evolving answer text. `FALSE` stores only timings, lengths and construction statistics.
+- `MaxAnswerCharacters`: maximum answer length accepted by both the page and server. Default: `40000`; supported range: 1,000–49,000.
+- `DeadlineGraceSeconds`: server-controlled allowance for network and lock delay after the displayed deadline. Default: `15`; supported range: 0–120.
+- `DraftRetentionHours`: expiry for unfinished answers stored in the candidate browser. Default: `24`; supported range: 1–168.
+- `MaxSnapshotsPerQuestion`: total snapshot sequence allowance. Default: `250`; supported range: 50–1,000. The browser reserves the final entries for paste and submit events.
 
 Full snapshot text creates considerably more personal data. Set `StoreSnapshotText` to `FALSE` when the timeline metrics are sufficient.
 
@@ -83,7 +92,11 @@ Each row is one timeline point for one question. Important columns include:
 - `AnswerSnapshot`: evolving answer text when `StoreSnapshotText` is `TRUE`.
 - `QuestionShownAtServer` and `ServerReceivedAt`.
 
-Snapshots are uploaded as the candidate works. A stable snapshot ID prevents duplicates when a request is retried. Snapshots that have not yet been acknowledged remain in browser session state and are resent at the next interval or with the final answer.
+Snapshots are uploaded as the candidate works. A stable snapshot ID prevents duplicates when a request is retried. Snapshots that have not yet been acknowledged remain in expiring browser draft storage and are resent at the next interval or with the final answer.
+
+Candidate drafts are stored only in the browser and expire according to
+`DraftRetentionHours`. Completing the assessment removes all drafts for that
+session from the device.
 
 ## New installation
 
@@ -124,13 +137,17 @@ Review:
 
 - `AssessmentTitle`
 - `CompanyName`
-- `CompanyLogoUrl`: optional HTTPS URL for the company logo; a built-in placeholder is shown when blank or unavailable.
+- `CompanyLogoUrl`: optional direct, publicly accessible HTTPS image URL. A built-in placeholder is shown when blank or unavailable. Ordinary Google Drive sharing-page URLs do not work as direct images. Loading an external logo lets that image host receive the browser request, although the page sends no referrer.
 - `DurationMinutes`
 - `WebAppUrl`
 - `PrivacyNotice`
 - `SourceFormUrl`
 - `SnapshotIntervalSeconds`
 - `StoreSnapshotText`
+- `MaxAnswerCharacters`
+- `DeadlineGraceSeconds`
+- `DraftRetentionHours`
+- `MaxSnapshotsPerQuestion`
 - `TelemetryInterpretation`
 
 ### 5. Import the existing Google Form
@@ -139,7 +156,7 @@ Review:
 2. Run `importQuestionsFromExistingForm`.
 3. Review `Questions` and `ImportLog`.
 
-The importer supports short text, paragraph text, multiple choice, dropdowns and linear scales. Sections become `GroupID` values. Matching `GF_…` question IDs are updated, new questions are appended, unrelated questions are preserved, and each run is appended to `ImportLog`. Unsupported items are listed in the log.
+The importer supports short text, paragraph text, multiple choice, dropdowns and linear scales. Sections become `GroupID` values. Matching `GF_…` question IDs are updated without changing their established order, new questions are appended, unrelated questions are preserved, and each run is appended to `ImportLog`. Previously imported questions that no longer exist in the source Form are retained but set to `Active = FALSE`, so historical and in-progress sessions remain intact. Importing does not replace a non-blank `AssessmentTitle`. Unsupported items are listed in the log.
 
 ### 6. Add candidates and deploy
 
@@ -148,6 +165,12 @@ The importer supports short text, paragraph text, multiple choice, dropdowns and
 3. Deploy as a web app, executing as the script owner and allowing anyone to access it. Your Google Workspace policy must permit anonymous web apps.
 4. Paste the `/exec` URL beside `WebAppUrl`.
 5. Run `generateCandidateTokens`.
+
+The administrative functions `setupAssessment`, `validateAssessmentSetup`,
+`importQuestionsFromExistingForm`, and `generateCandidateTokens` must be run by
+an authorised editor. Anonymous web-app visitors cannot invoke them. If an
+authorised editor must use a different account, add a comma-separated
+`ADMIN_EMAILS` script property in **Project Settings > Script properties**.
 
 ### 7. Test
 

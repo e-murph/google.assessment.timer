@@ -30,6 +30,7 @@ const HEADERS = Object.freeze({
     'Options',
     'Required',
     'MaxWords',
+    'Active',
   ],
   CANDIDATES: [
     'CandidateName',
@@ -65,6 +66,7 @@ const HEADERS = Object.freeze({
     'TotalRedoCount',
     'TotalSnapshotCount',
     'ClientTelemetryStatus',
+    'SessionNonce',
   ],
   RESPONSES: [
     'SessionID',
@@ -154,6 +156,12 @@ const HEADERS = Object.freeze({
  * It creates the required sheets and sample rows.
  */
 function setupAssessment() {
+  assertAdministrator_();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    throw new Error('The assessment is busy. Wait for active submissions to finish, then run setup again.');
+  }
+  try {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
     throw new Error('Open this script from a Google Sheet using Extensions > Apps Script.');
@@ -181,6 +189,10 @@ function setupAssessment() {
   ensureSetting_(settings, 'SourceFormUrl', '');
   ensureSetting_(settings, 'SnapshotIntervalSeconds', 15);
   ensureSetting_(settings, 'StoreSnapshotText', true);
+  ensureSetting_(settings, 'MaxAnswerCharacters', 40000);
+  ensureSetting_(settings, 'DeadlineGraceSeconds', 15);
+  ensureSetting_(settings, 'DraftRetentionHours', 24);
+  ensureSetting_(settings, 'MaxSnapshotsPerQuestion', 250);
   ensureSetting_(
     settings,
     'TelemetryInterpretation',
@@ -193,18 +205,32 @@ function setupAssessment() {
   );
 
   if (questions.getLastRow() <= 1) {
-    questions.getRange(2, 1, 3, HEADERS.QUESTIONS.length).setValues([
-      [1, 'Q1', 'A', 'Explain your approach to the example task.', 'long_text', '', true, 300],
-      [2, 'Q2', 'A', 'Which option is most appropriate?', 'multiple_choice', 'Option A|Option B|Option C', true, ''],
-      [3, 'Q3', 'B', 'Add any final comments.', 'short_text', '', false, 100],
-    ]);
+    appendMappedRowToSheet_(questions, {
+      Order: 1, QuestionID: 'Q1', GroupID: 'A',
+      QuestionText: 'Explain your approach to the example task.',
+      AnswerType: 'long_text', Required: true, MaxWords: 300, Active: true,
+    });
+    appendMappedRowToSheet_(questions, {
+      Order: 2, QuestionID: 'Q2', GroupID: 'A',
+      QuestionText: 'Which option is most appropriate?',
+      AnswerType: 'multiple_choice', Options: 'Option A|Option B|Option C',
+      Required: true, Active: true,
+    });
+    appendMappedRowToSheet_(questions, {
+      Order: 3, QuestionID: 'Q3', GroupID: 'B',
+      QuestionText: 'Add any final comments.', AnswerType: 'short_text',
+      Required: false, MaxWords: 100, Active: true,
+    });
   }
 
   if (candidates.getLastRow() <= 1) {
-    candidates.getRange(2, 1, 1, HEADERS.CANDIDATES.length).setValues([
-      ['Example Candidate', 'candidate@example.com', '', true, '', '', 'Delete this example row before use.'],
-    ]);
+    appendMappedRowToSheet_(candidates, {
+      CandidateName: 'Example Candidate', CandidateEmail: 'candidate@example.com',
+      Active: true, Notes: 'Delete this example row before use.',
+    });
   }
+
+  const backfilledLegacySessions = backfillLegacySessionQuestions_();
 
   [
     settings,
@@ -219,17 +245,26 @@ function setupAssessment() {
     sheet.autoResizeColumns(1, sheet.getLastColumn());
   });
 
-  sessions.getRange('E:G').setNumberFormat('yyyy-mm-dd hh:mm:ss');
-  sessions.getRange('I:I').setNumberFormat('yyyy-mm-dd hh:mm:ss');
-  sessions.getRange('K:K').setNumberFormat('yyyy-mm-dd hh:mm:ss');
-  responses.getRange('J:K').setNumberFormat('yyyy-mm-dd hh:mm:ss');
-  snapshots.getRange('X:Y').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  formatColumnsByHeader_(sessions, [
+    'StartedAt', 'DeadlineAt', 'LastActivityAt', 'CurrentQuestionShownAt', 'CompletedAt',
+  ], 'yyyy-mm-dd hh:mm:ss');
+  formatColumnsByHeader_(responses, [
+    'QuestionShownAtServer', 'SubmittedAtServer',
+  ], 'yyyy-mm-dd hh:mm:ss');
+  formatColumnsByHeader_(snapshots, [
+    'QuestionShownAtServer', 'ServerReceivedAt',
+  ], 'yyyy-mm-dd hh:mm:ss');
+  SpreadsheetApp.flush();
 
   return [
     'Setup and telemetry upgrade complete.',
     'Existing rows were preserved.',
-    'Review CompanyName, CompanyLogoUrl, PrivacyNotice, SnapshotIntervalSeconds and StoreSnapshotText in Settings, then deploy a new version of the web app.',
+    `Frozen questions were backfilled for ${backfilledLegacySessions} legacy in-progress session(s).`,
+    'Review branding, privacy, timing, answer-limit, draft-retention and snapshot settings, then deploy a new version of the web app.',
   ].join('\n');
+  } finally {
+    flushAndReleaseLock_(lock);
+  }
 }
 
 /**
@@ -237,6 +272,7 @@ function setupAssessment() {
  * into Settings!B for the WebAppUrl row.
  */
 function generateCandidateTokens() {
+  assertAdministrator_();
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
 
@@ -263,7 +299,7 @@ function generateCandidateTokens() {
         .filter(Boolean)
     );
 
-    table.rows.forEach((row) => {
+    table.rows.forEach((row, index) => {
       const name = String(row[table.map.CandidateName] || '').trim();
       const email = String(row[table.map.CandidateEmail] || '').trim();
       if (!name && !email) return;
@@ -273,29 +309,24 @@ function generateCandidateTokens() {
         do {
           token = Utilities.getUuid().replace(/-/g, '');
         } while (usedTokens.has(token));
-        row[table.map.Token] = token;
         usedTokens.add(token);
       }
 
-      if (row[table.map.Active] === '') {
-        row[table.map.Active] = true;
-      }
+      const updates = { Token: token };
+      if (row[table.map.Active] === '') updates.Active = true;
 
       if (hasValidUrl) {
         const separator = webAppUrl.includes('?') ? '&' : '?';
-        row[table.map.Link] = `${webAppUrl}${separator}token=${encodeURIComponent(token)}`;
+        updates.Link = `${webAppUrl}${separator}token=${encodeURIComponent(token)}`;
       }
+      setMappedValuesInRow_(table, index + 2, updates);
     });
-
-    table.sheet
-      .getRange(2, 1, table.rows.length, table.headers.length)
-      .setValues(table.rows);
 
     return hasValidUrl
       ? 'Candidate tokens and links generated.'
       : 'Tokens generated. Paste the deployed web-app URL into Settings, then run generateCandidateTokens again to create links.';
   } finally {
-    lock.releaseLock();
+    flushAndReleaseLock_(lock);
   }
 }
 
@@ -313,7 +344,7 @@ function doGet(e) {
   template.assessmentTitle = String(settings.AssessmentTitle || APP.DEFAULT_TITLE);
   template.companyName = String(settings.CompanyName || 'Your Company');
   const configuredLogoUrl = String(settings.CompanyLogoUrl || '').trim();
-  template.companyLogoUrl = /^https:\/\//i.test(configuredLogoUrl) ? configuredLogoUrl : '';
+  template.companyLogoUrl = isSafeHttpsImageUrl_(configuredLogoUrl) ? configuredLogoUrl : '';
   template.privacyNotice = String(settings.PrivacyNotice || 'Assessment activity is logged.');
 
   return template
@@ -331,9 +362,19 @@ function startAssessment(token, clientInfo) {
   if (!cleanToken) {
     return failure_('A candidate token is required. Open the unique link supplied to you.');
   }
+  if (!isValidIdentifier_(cleanToken, 250)) return failure_('This candidate link is not valid.');
+  if (isRateLimited_('start', cleanToken, 10, 60)) {
+    return failure_('Too many start attempts were received. Wait a minute and try again.', 'RATE_LIMIT');
+  }
+
+  // Reject bad bearer tokens before they can occupy the global write lock.
+  const preflightCandidate = findCandidateByToken_(cleanToken);
+  if (!preflightCandidate) return failure_('This candidate link is not valid.');
 
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  if (!lock.tryLock(10000)) {
+    return failure_('The assessment is busy saving another response. Please try again.', 'BUSY');
+  }
 
   try {
     const candidate = findCandidateByToken_(cleanToken);
@@ -371,6 +412,7 @@ function startAssessment(token, clientInfo) {
     const startedAt = now;
     const deadlineAt = new Date(startedAt.getTime() + durationMinutes * 60 * 1000);
     const sessionId = Utilities.getUuid();
+    const sessionNonce = Utilities.getUuid().replace(/-/g, '');
     const browserInfo = truncate_(JSON.stringify(clientInfo || {}), 2000);
 
     // Freeze the exact question set before creating the session so later edits
@@ -401,13 +443,14 @@ function startAssessment(token, clientInfo) {
       TotalRedoCount: 0,
       TotalSnapshotCount: 0,
       ClientTelemetryStatus: 'UNVERIFIED_CLIENT_REPORTED',
+      SessionNonce: sessionNonce,
     });
 
     updateCandidateStatus_(candidate.rowNumber, 'IN_PROGRESS');
     session = findSessionById_(sessionId);
     return buildClientState_(session, questions, now);
   } finally {
-    lock.releaseLock();
+    flushAndReleaseLock_(lock);
   }
 }
 
@@ -419,13 +462,28 @@ function saveAndNext(payload) {
   payload = payload || {};
   const sessionId = String(payload.sessionId || '').trim();
   if (!sessionId) return failure_('The assessment session is missing. Reload your unique link.');
+  if (!isValidIdentifier_(sessionId, 200)) return failure_('The assessment session is invalid.');
+  if (isRateLimited_('submit', sessionId, 30, 60)) {
+    return failure_('Too many submission attempts were received. Wait a moment and try again.', 'RATE_LIMIT');
+  }
+
+  const preflightSession = findSessionById_(sessionId);
+  if (!preflightSession) return failure_('The assessment session could not be found.');
+  if (!sessionNonceMatches_(preflightSession, payload.sessionNonce)) {
+    return failure_('The assessment session could not be authenticated. Reload your unique link.');
+  }
 
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  if (!lock.tryLock(10000)) {
+    return failure_('Your answer is still stored in this browser. Please try submitting again.', 'BUSY');
+  }
 
   try {
     const session = findSessionById_(sessionId);
     if (!session) return failure_('The assessment session could not be found.');
+    if (!sessionNonceMatches_(session, payload.sessionNonce)) {
+      return failure_('The assessment session could not be authenticated. Reload your unique link.');
+    }
     if (session.status !== 'IN_PROGRESS') {
       updateCandidateStatusByToken_(session.token, session.status);
       return {
@@ -458,11 +516,25 @@ function saveAndNext(payload) {
 
     const now = new Date();
     const requestSettings = getSettings_();
-    const overTime = now.getTime() > session.deadlineAt.getTime();
+    const deadlineGraceSeconds = Math.min(
+      120,
+      Math.max(0, Number(requestSettings.DeadlineGraceSeconds) || 0)
+    );
+    const deadlineExpired = now.getTime() > session.deadlineAt.getTime();
+    const overTime = now.getTime() > session.deadlineAt.getTime() + deadlineGraceSeconds * 1000;
     const forceComplete = Boolean(payload.forceComplete);
+    const timeExpiredSubmission = overTime || (forceComplete && deadlineExpired);
     const submissionId = truncate_(String(payload.submissionId || Utilities.getUuid()), 200);
     const answer = String(payload.answer == null ? '' : payload.answer).trim();
     const answerWords = countWords_(answer);
+    const maxAnswerCharacters = getMaxAnswerCharacters_(requestSettings);
+
+    if (answer.length > maxAnswerCharacters) {
+      return failure_(
+        `This answer is ${answer.length} characters. The maximum is ${maxAnswerCharacters}.`,
+        'VALIDATION'
+      );
+    }
 
     if (!overTime && !forceComplete) {
       if (question.required && !answer) {
@@ -548,7 +620,7 @@ function saveAndNext(payload) {
       AnswerCharacters: answer.length,
       AnswerWords: answerWords,
       Required: question.required,
-      OverTime: overTime,
+      OverTime: timeExpiredSubmission,
       BrowserInfo: safeForSheet_(session.browserInfo),
       TypedCharacters: typedCharacters,
       PastedCharacters: pastedCharacters,
@@ -571,7 +643,7 @@ function saveAndNext(payload) {
     const shouldComplete = overTime || forceComplete || isLastQuestion;
 
     if (shouldComplete) {
-      const finalStatus = overTime ? 'TIME_EXPIRED' : 'COMPLETED';
+      const finalStatus = timeExpiredSubmission ? 'TIME_EXPIRED' : 'COMPLETED';
       updateSession_(session.rowNumber, {
         LastActivityAt: now,
         CurrentQuestionIndex: nextIndex,
@@ -631,7 +703,7 @@ function saveAndNext(payload) {
     session.totalSnapshotCount = snapshotCounts.session;
     return buildClientState_(session, questions, now, requestSettings);
   } finally {
-    lock.releaseLock();
+    flushAndReleaseLock_(lock);
   }
 }
 
@@ -644,6 +716,10 @@ function saveProgress(payload) {
   payload = payload || {};
   const sessionId = String(payload.sessionId || '').trim();
   if (!sessionId) return failure_('The assessment session is missing.');
+  if (!isValidIdentifier_(sessionId, 200)) return failure_('The assessment session is invalid.');
+  if (isRateLimited_('progress', sessionId, 120, 60)) {
+    return failure_('Progress saving is temporarily rate limited.', 'RATE_LIMIT');
+  }
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(500)) {
@@ -658,6 +734,9 @@ function saveProgress(payload) {
     const session = findSessionById_(sessionId);
     if (!session || session.status !== 'IN_PROGRESS') {
       return failure_('The assessment session is no longer in progress.');
+    }
+    if (!sessionNonceMatches_(session, payload.sessionNonce)) {
+      return failure_('The assessment session could not be authenticated.');
     }
 
     const questions = getQuestionsForSession_(session);
@@ -685,12 +764,13 @@ function saveProgress(payload) {
       savedSnapshotIds: snapshots.map((snapshot) => snapshot.SnapshotID),
     };
   } finally {
-    lock.releaseLock();
+    flushAndReleaseLock_(lock);
   }
 }
 
 /** Optional diagnostic function to run from the editor. */
 function validateAssessmentSetup() {
+  assertAdministrator_();
   const problems = [];
   const settings = getSettings_();
   const questions = getQuestions_();
@@ -699,13 +779,25 @@ function validateAssessmentSetup() {
   if (!settings.AssessmentTitle) problems.push('AssessmentTitle is blank.');
   if (!String(settings.CompanyName || '').trim()) problems.push('CompanyName is blank.');
   const companyLogoUrl = String(settings.CompanyLogoUrl || '').trim();
-  if (companyLogoUrl && !/^https:\/\//i.test(companyLogoUrl)) {
-    problems.push('CompanyLogoUrl must be blank or begin with https://.');
+  if (companyLogoUrl && !isSafeHttpsImageUrl_(companyLogoUrl)) {
+    problems.push('CompanyLogoUrl must be a valid HTTPS URL without spaces or embedded credentials.');
   }
   if (!(Number(settings.DurationMinutes) > 0)) problems.push('DurationMinutes must be greater than zero.');
   const snapshotIntervalSeconds = Number(settings.SnapshotIntervalSeconds);
   if (!(snapshotIntervalSeconds >= 5 && snapshotIntervalSeconds <= 300)) {
     problems.push('SnapshotIntervalSeconds must be between 5 and 300.');
+  }
+  if (!(Number(settings.MaxAnswerCharacters) >= 1000 && Number(settings.MaxAnswerCharacters) <= 49000)) {
+    problems.push('MaxAnswerCharacters must be between 1000 and 49000.');
+  }
+  if (!(Number(settings.DeadlineGraceSeconds) >= 0 && Number(settings.DeadlineGraceSeconds) <= 120)) {
+    problems.push('DeadlineGraceSeconds must be between 0 and 120.');
+  }
+  if (!(Number(settings.DraftRetentionHours) >= 1 && Number(settings.DraftRetentionHours) <= 168)) {
+    problems.push('DraftRetentionHours must be between 1 and 168.');
+  }
+  if (!(Number(settings.MaxSnapshotsPerQuestion) >= 50 && Number(settings.MaxSnapshotsPerQuestion) <= 1000)) {
+    problems.push('MaxSnapshotsPerQuestion must be between 50 and 1000.');
   }
   if (!/^https:\/\/script\.google\.com\//i.test(String(settings.WebAppUrl || ''))) {
     problems.push('WebAppUrl has not been set to the deployed Apps Script URL.');
@@ -790,13 +882,76 @@ function ensureSheet_(ss, name, headers) {
 }
 
 function ensureSetting_(settingsSheet, key, defaultValue) {
+  const structure = getSheetStructure_(settingsSheet);
+  if (!(HEADERS.SETTINGS[0] in structure.map) || !(HEADERS.SETTINGS[1] in structure.map)) {
+    throw new Error('Settings must contain Key and Value headers.');
+  }
   const lastRow = settingsSheet.getLastRow();
   if (lastRow > 1) {
-    const values = settingsSheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    const values = settingsSheet
+      .getRange(2, structure.map.Key + 1, lastRow - 1, 1)
+      .getValues();
     const exists = values.some((row) => String(row[0] || '').trim() === key);
     if (exists) return;
   }
-  settingsSheet.appendRow([key, defaultValue]);
+  appendMappedRowToSheet_(settingsSheet, { Key: key, Value: defaultValue });
+}
+
+function getSheetStructure_(sheet) {
+  const headers = sheet
+    .getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1))
+    .getValues()[0]
+    .map((value) => String(value || '').trim());
+  const map = {};
+  headers.forEach((header, index) => {
+    if (header) map[header] = index;
+  });
+  return { sheet, headers, map };
+}
+
+function appendMappedRowToSheet_(sheet, valuesByHeader) {
+  const structure = getSheetStructure_(sheet);
+  const row = Array(structure.headers.length).fill('');
+  Object.keys(valuesByHeader).forEach((header) => {
+    if (!(header in structure.map)) throw new Error(`${sheet.getName()} is missing ${header}.`);
+    row[structure.map[header]] = valuesByHeader[header];
+  });
+  sheet.appendRow(row);
+}
+
+function formatColumnsByHeader_(sheet, headers, numberFormat) {
+  const structure = getSheetStructure_(sheet);
+  headers.forEach((header) => {
+    if (!(header in structure.map)) throw new Error(`${sheet.getName()} is missing ${header}.`);
+    sheet
+      .getRange(2, structure.map[header] + 1, Math.max(sheet.getMaxRows() - 1, 1), 1)
+      .setNumberFormat(numberFormat);
+  });
+}
+
+/** Update only named cells, preserving formulas and custom columns elsewhere in the row. */
+function setMappedValuesInRow_(table, rowNumber, valuesByHeader) {
+  const cells = Object.keys(valuesByHeader)
+    .map((header) => {
+      if (!(header in table.map)) throw new Error(`${table.sheet.getName()} is missing ${header}.`);
+      return { column: table.map[header] + 1, value: valuesByHeader[header] };
+    })
+    .sort((a, b) => a.column - b.column);
+
+  let group = [];
+  const writeGroup = () => {
+    if (!group.length) return;
+    table.sheet
+      .getRange(rowNumber, group[0].column, 1, group.length)
+      .setValues([group.map((cell) => cell.value)]);
+    group = [];
+  };
+
+  cells.forEach((cell) => {
+    if (group.length && cell.column !== group[group.length - 1].column + 1) writeGroup();
+    group.push(cell);
+  });
+  writeGroup();
 }
 
 function appendMappedRow_(sheetName, valuesByHeader) {
@@ -818,12 +973,33 @@ function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
   const submissionId = String(valuesByHeader.SubmissionID || '').trim();
 
   if (lastRow > 1 && submissionId) {
-    const match = table.sheet
+    const matches = table.sheet
       .getRange(2, table.map.SubmissionID + 1, lastRow - 1, 1)
       .createTextFinder(submissionId)
+      .matchCase(true)
       .matchEntireCell(true)
-      .findNext();
-    if (match) sheetRow = match.getRow();
+      .findAll();
+    if (matches.length > 1) {
+      throw new Error('Duplicate SubmissionID values exist in Responses. Correct them before continuing.');
+    }
+    if (matches.length === 1) {
+      const candidateRow = matches[0].getRow();
+      const storedIdentity = table.sheet
+        .getRange(
+          candidateRow,
+          Math.min(table.map.SessionID, table.map.QuestionID) + 1,
+          1,
+          Math.abs(table.map.QuestionID - table.map.SessionID) + 1
+        )
+        .getValues()[0];
+      const firstColumn = Math.min(table.map.SessionID, table.map.QuestionID);
+      const storedSessionId = String(storedIdentity[table.map.SessionID - firstColumn] || '').trim();
+      const storedQuestionId = String(storedIdentity[table.map.QuestionID - firstColumn] || '').trim();
+      if (storedSessionId !== sessionId || storedQuestionId !== questionId) {
+        throw new Error('The submission identifier conflicts with another response. Reload and try again.');
+      }
+      sheetRow = candidateRow;
+    }
   }
 
   // Compatibility fallback for submissions made before SubmissionID existed.
@@ -831,6 +1007,7 @@ function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
     const sessionMatches = table.sheet
       .getRange(2, table.map.SessionID + 1, lastRow - 1, 1)
       .createTextFinder(sessionId)
+      .matchCase(true)
       .matchEntireCell(true)
       .findAll();
     for (let index = sessionMatches.length - 1; index >= 0; index -= 1) {
@@ -845,19 +1022,19 @@ function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
     }
   }
 
-  const row = sheetRow >= 0
-    ? table.sheet.getRange(sheetRow, 1, 1, table.headers.length).getValues()[0]
-    : Array(table.headers.length).fill('');
   Object.keys(valuesByHeader).forEach((header) => {
     if (!(header in table.map)) {
       throw new Error(`Required Responses column is missing: ${header}. Run setupAssessment.`);
     }
-    row[table.map[header]] = valuesByHeader[header];
   });
 
   if (sheetRow >= 0) {
-    table.sheet.getRange(sheetRow, 1, 1, table.headers.length).setValues([row]);
+    setMappedValuesInRow_(table, sheetRow, valuesByHeader);
   } else {
+    const row = Array(table.headers.length).fill('');
+    Object.keys(valuesByHeader).forEach((header) => {
+      row[table.map[header]] = valuesByHeader[header];
+    });
     table.sheet.appendRow(row);
   }
 }
@@ -908,6 +1085,7 @@ function appendSnapshotRows_(snapshots) {
       snapshots.length <= 10 &&
       snapshotIdRange
         .createTextFinder(snapshotId)
+        .matchCase(true)
         .matchEntireCell(true)
         .findNext()
     ) {
@@ -937,7 +1115,10 @@ function normaliseSnapshots_(rawSnapshots, context) {
 
   const settings = context.settings || getSettings_();
   const storeSnapshotText = toBoolean_(settings.StoreSnapshotText);
-  const maximumSnapshots = 250;
+  const maximumSnapshots = Math.min(
+    1000,
+    Math.max(50, Number(settings.MaxSnapshotsPerQuestion) || 250)
+  );
   const maximumTextCharacters = 20000;
   const permittedReasons = new Set(['question_shown', 'interval', 'paste', 'submit', 'restored']);
 
@@ -1071,6 +1252,8 @@ function getQuestions_() {
   const questions = [];
 
   table.rows.forEach((row, rowIndex) => {
+    const activeValue = row[table.map.Active];
+    if (String(activeValue == null ? '' : activeValue).trim() && !toBoolean_(activeValue)) return;
     const text = String(row[table.map.QuestionText] || '').trim();
     if (!text) return;
 
@@ -1183,6 +1366,57 @@ function saveSessionQuestions_(sessionId, questions) {
   cacheSessionQuestions_(sessionId, questions);
 }
 
+function backfillLegacySessionQuestions_() {
+  const sessions = getTable_(APP.SHEETS.SESSIONS);
+  const frozenQuestions = getTable_(APP.SHEETS.SESSION_QUESTIONS);
+  const existingSessionIds = new Set(
+    frozenQuestions.rows
+      .map((row) => String(row[frozenQuestions.map.SessionID] || '').trim())
+      .filter(Boolean)
+  );
+  const legacySessionIds = sessions.rows
+    .filter((row) => String(row[sessions.map.Status] || '').trim().toUpperCase() === 'IN_PROGRESS')
+    .map((row) => String(row[sessions.map.SessionID] || '').trim())
+    .filter((sessionId) => sessionId && !existingSessionIds.has(sessionId));
+  if (!legacySessionIds.length) return 0;
+
+  const questions = getQuestions_();
+  if (!questions.length) return 0;
+  const rows = [];
+  legacySessionIds.forEach((sessionId) => {
+    questions.forEach((question, index) => {
+      const row = Array(frozenQuestions.headers.length).fill('');
+      const values = {
+        SessionID: sessionId,
+        QuestionIndex: index,
+        Order: question.order,
+        QuestionID: question.id,
+        GroupID: safeForSheet_(question.groupId),
+        QuestionText: safeForSheet_(question.text),
+        AnswerType: question.answerType,
+        Options: safeForSheet_(JSON.stringify(question.options)),
+        Required: question.required,
+        MaxWords: question.maxWords == null ? '' : question.maxWords,
+      };
+      Object.keys(values).forEach((header) => {
+        row[frozenQuestions.map[header]] = values[header];
+      });
+      rows.push(row);
+    });
+    cacheSessionQuestions_(sessionId, questions);
+  });
+
+  frozenQuestions.sheet
+    .getRange(
+      frozenQuestions.sheet.getLastRow() + 1,
+      1,
+      rows.length,
+      frozenQuestions.headers.length
+    )
+    .setValues(rows);
+  return legacySessionIds.length;
+}
+
 function getQuestionsForSession_(session, fallbackQuestions) {
   const cachedQuestions = readCachedSessionQuestions_(session.sessionId);
   if (cachedQuestions) return cachedQuestions;
@@ -1273,6 +1507,7 @@ function findCandidateByToken_(token) {
   const matches = table.sheet
     .getRange(2, table.map.Token + 1, lastRow - 1, 1)
     .createTextFinder(token)
+    .matchCase(true)
     .matchEntireCell(true)
     .findAll();
   if (!matches.length) return null;
@@ -1324,6 +1559,7 @@ function findLatestSessionByToken_(token) {
   const matches = table.sheet
     .getRange(2, table.map.Token + 1, lastRow - 1, 1)
     .createTextFinder(token)
+    .matchCase(true)
     .matchEntireCell(true)
     .findAll();
   if (!matches.length) return null;
@@ -1339,6 +1575,7 @@ function findSessionById_(sessionId) {
   const match = table.sheet
     .getRange(2, table.map.SessionID + 1, lastRow - 1, 1)
     .createTextFinder(sessionId)
+    .matchCase(true)
     .matchEntireCell(true)
     .findNext();
   if (!match) return null;
@@ -1373,21 +1610,16 @@ function sessionFromRow_(row, rowNumber, map) {
     totalUndoCount: Number(row[map.TotalUndoCount]) || 0,
     totalRedoCount: Number(row[map.TotalRedoCount]) || 0,
     totalSnapshotCount: Number(row[map.TotalSnapshotCount]) || 0,
+    sessionNonce: String(row[map.SessionNonce] || ''),
   };
 }
 
 function updateSession_(rowNumber, updates) {
   const table = getTableStructure_(APP.SHEETS.SESSIONS);
-  const row = table.sheet
-    .getRange(rowNumber, 1, 1, table.headers.length)
-    .getValues()[0];
-
   Object.keys(updates).forEach((header) => {
     if (!(header in table.map)) throw new Error(`Unknown Sessions column: ${header}`);
-    row[table.map[header]] = updates[header];
   });
-
-  table.sheet.getRange(rowNumber, 1, 1, table.headers.length).setValues([row]);
+  setMappedValuesInRow_(table, rowNumber, updates);
 }
 
 function completeSession_(session, status, completedAt) {
@@ -1406,6 +1638,14 @@ function buildClientState_(session, questions, now, suppliedSettings) {
     300,
     Math.max(5, Number(settings.SnapshotIntervalSeconds) || 15)
   );
+  const maxSnapshotsPerQuestion = Math.min(
+    1000,
+    Math.max(50, Number(settings.MaxSnapshotsPerQuestion) || 250)
+  );
+  const draftRetentionHours = Math.min(
+    168,
+    Math.max(1, Number(settings.DraftRetentionHours) || 24)
+  );
 
   if (!question) {
     return {
@@ -1420,6 +1660,7 @@ function buildClientState_(session, questions, now, suppliedSettings) {
     ok: true,
     completed: false,
     sessionId: session.sessionId,
+    sessionNonce: session.sessionNonce || '',
     candidateName: session.candidateName,
     startedAtMs: session.startedAt.getTime(),
     deadlineAtMs: session.deadlineAt.getTime(),
@@ -1428,6 +1669,9 @@ function buildClientState_(session, questions, now, suppliedSettings) {
     totalQuestions: questions.length,
     questionShownAtMs: session.currentQuestionShownAt.getTime(),
     snapshotIntervalSeconds,
+    maxSnapshotsPerQuestion,
+    maxAnswerCharacters: getMaxAnswerCharacters_(settings),
+    draftRetentionHours,
     storeSnapshotText: toBoolean_(settings.StoreSnapshotText),
     question: {
       id: question.id,
@@ -1447,6 +1691,87 @@ function failure_(message, code) {
     code: code || 'ERROR',
     message: String(message || 'An error occurred.'),
   };
+}
+
+function getMaxAnswerCharacters_(settings) {
+  return Math.min(49000, Math.max(1000, Number(settings.MaxAnswerCharacters) || 40000));
+}
+
+function isSafeHttpsImageUrl_(value) {
+  const url = String(value || '').trim();
+  return Boolean(url) &&
+    url.length <= 2048 &&
+    /^https:\/\/[^\s<>"']+$/i.test(url) &&
+    !/^https:\/\/[^/]*@/i.test(url);
+}
+
+function sessionNonceMatches_(session, suppliedNonce) {
+  // Sessions created before the nonce migration remain valid.
+  if (!session.sessionNonce) return true;
+  return secureEquals_(session.sessionNonce, String(suppliedNonce || ''));
+}
+
+function secureEquals_(left, right) {
+  const first = String(left || '');
+  const second = String(right || '');
+  let difference = first.length ^ second.length;
+  const length = Math.max(first.length, second.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (first.charCodeAt(index) || 0) ^ (second.charCodeAt(index) || 0);
+  }
+  return difference === 0;
+}
+
+function isValidIdentifier_(value, maximumLength) {
+  const text = String(value || '');
+  return Boolean(text) && text.length <= maximumLength && !/[\u0000-\u001f\u007f]/.test(text);
+}
+
+/** Best-effort abuse protection. Cache failure never blocks a legitimate candidate. */
+function isRateLimited_(operation, identifier, maximumRequests, windowSeconds) {
+  try {
+    const digest = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      `${operation}:${identifier}`,
+      Utilities.Charset.UTF_8
+    );
+    const hash = digest
+      .map((byte) => ((byte + 256) % 256).toString(16).padStart(2, '0'))
+      .join('');
+    const cache = CacheService.getScriptCache();
+    const key = `rate:${operation}:${hash}`;
+    const count = Number(cache.get(key) || 0) + 1;
+    cache.put(key, String(count), windowSeconds);
+    return count > maximumRequests;
+  } catch (error) {
+    return false;
+  }
+}
+
+/** Administrative entry points are editor-only even though their names stay public. */
+function assertAdministrator_() {
+  const activeEmail = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase();
+  const effectiveEmail = String(Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
+  const configuredAdmins = String(
+    PropertiesService.getScriptProperties().getProperty('ADMIN_EMAILS') || ''
+  )
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+  const isAdministrator = Boolean(activeEmail) && (
+    activeEmail === effectiveEmail || configuredAdmins.includes(activeEmail)
+  );
+  if (!isAdministrator) {
+    throw new Error('This administrative function can only be run by an authorised editor.');
+  }
+}
+
+function flushAndReleaseLock_(lock) {
+  try {
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function toBoolean_(value) {
