@@ -228,6 +228,7 @@
       let storageKey = '';
       let previousAnswer = '';
       let pendingPasteAt = 0;
+      let snapshotFlushInProgress = false;
 
       els.startButton.addEventListener('click', beginAssessment);
       els.nextButton.addEventListener('click', () => submitCurrent(false));
@@ -341,9 +342,10 @@
         previousAnswer = readAnswer();
         updateWordCount();
         startActiveSegment();
+        captureSnapshot(wasRestored ? 'restored' : 'question_shown', true);
         startOverallTimer();
         startSnapshotTimer();
-        captureSnapshot(wasRestored ? 'restored' : 'question_shown', true);
+        flushProgress();
 
         els.nextButton.textContent =
           state.currentNumber === state.totalQuestions ? 'Submit assessment' : 'Save and continue';
@@ -369,6 +371,8 @@
           redoCount: 0,
           lastEditMs: null,
           snapshots: [],
+          snapshotSequence: 0,
+          submissionId: createClientId(),
         };
 
         try {
@@ -376,6 +380,11 @@
           if (!saved || typeof saved !== 'object') return defaults;
           const merged = { ...defaults, ...saved };
           merged.snapshots = Array.isArray(saved.snapshots) ? saved.snapshots : [];
+          merged.snapshotSequence = Math.max(
+            Number(merged.snapshotSequence) || 0,
+            ...merged.snapshots.map((snapshot) => Number(snapshot.sequence) || 0)
+          );
+          if (!merged.submissionId) merged.submissionId = createClientId();
           return merged;
         } catch (error) {
           return defaults;
@@ -494,7 +503,10 @@
           metrics.pasteCount += 1;
           pendingPasteAt = Date.now();
           persistState();
-          setTimeout(() => captureSnapshot('paste', true), 0);
+          setTimeout(() => {
+            captureSnapshot('paste', true);
+            flushProgress();
+          }, 0);
         });
 
         input.addEventListener('keydown', () => {
@@ -594,6 +606,7 @@
         const payload = {
           sessionId: state.sessionId,
           questionId: state.question.id,
+          submissionId: metrics.submissionId,
           answer,
           activeMs: metrics.activeMs,
           firstInteractionMs: metrics.firstInteractionMs,
@@ -671,7 +684,10 @@
           Math.max(5, Number(state.snapshotIntervalSeconds) || 15)
         );
         snapshotTimerHandle = setInterval(
-          () => captureSnapshot('interval', false),
+          () => {
+            captureSnapshot('interval', false);
+            flushProgress();
+          },
           intervalSeconds * 1000
         );
       }
@@ -685,7 +701,7 @@
 
       function captureSnapshot(reason, force) {
         if (!assessmentInProgress || !state || !metrics) return;
-        if (metrics.snapshots.length >= 250) return;
+        if (metrics.snapshotSequence >= 250) return;
 
         const capturedMs = elapsedSinceQuestionShown();
         const lastSnapshot = metrics.snapshots[metrics.snapshots.length - 1];
@@ -699,7 +715,10 @@
 
         const answer = readAnswer();
         metrics.answer = answer;
+        metrics.snapshotSequence += 1;
         metrics.snapshots.push({
+          snapshotId: createClientId(),
+          sequence: metrics.snapshotSequence,
           reason,
           capturedMs,
           activeMs: currentActiveMs(),
@@ -717,6 +736,55 @@
           snapshotTextTruncated: state.storeSnapshotText && answer.length > 20000,
         });
         persistState();
+      }
+
+      function flushProgress() {
+        if (
+          snapshotFlushInProgress ||
+          submitting ||
+          !assessmentInProgress ||
+          !state ||
+          !metrics ||
+          !metrics.snapshots.length
+        ) {
+          return;
+        }
+
+        const snapshotsToSave = metrics.snapshots.slice();
+        const sentIds = new Set(snapshotsToSave.map((snapshot) => snapshot.snapshotId));
+        snapshotFlushInProgress = true;
+
+        google.script.run
+          .withSuccessHandler((result) => {
+            snapshotFlushInProgress = false;
+            if (result && result.ok) {
+              const savedIds = new Set(result.savedSnapshotIds || []);
+              metrics.snapshots = metrics.snapshots.filter(
+                (snapshot) => !sentIds.has(snapshot.snapshotId) || !savedIds.has(snapshot.snapshotId)
+              );
+              persistState();
+            }
+          })
+          .withFailureHandler(() => {
+            snapshotFlushInProgress = false;
+            // Pending snapshots remain in local storage and are retried later
+            // or included with the final answer submission.
+          })
+          .saveProgress({
+            sessionId: state.sessionId,
+            questionId: state.question.id,
+            submissionId: metrics.submissionId,
+            snapshots: snapshotsToSave,
+          });
+      }
+
+      function createClientId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID();
+        }
+        return `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random()
+          .toString(16)
+          .slice(2)}`;
       }
 
       function startOverallTimer() {

@@ -15,6 +15,7 @@ const APP = Object.freeze({
     SESSIONS: 'Sessions',
     RESPONSES: 'Responses',
     SNAPSHOTS: 'AnswerSnapshots',
+    SESSION_QUESTIONS: 'SessionQuestions',
   }),
 });
 
@@ -100,6 +101,7 @@ const HEADERS = Object.freeze({
     'LastEditSecondsClient',
     'EditingSpanSecondsClient',
     'SnapshotCount',
+    'SubmissionID',
   ],
   SNAPSHOTS: [
     'SessionID',
@@ -127,6 +129,20 @@ const HEADERS = Object.freeze({
     'SnapshotTextTruncated',
     'QuestionShownAtServer',
     'ServerReceivedAt',
+    'SnapshotID',
+    'SubmissionID',
+  ],
+  SESSION_QUESTIONS: [
+    'SessionID',
+    'QuestionIndex',
+    'Order',
+    'QuestionID',
+    'GroupID',
+    'QuestionText',
+    'AnswerType',
+    'Options',
+    'Required',
+    'MaxWords',
   ],
 });
 
@@ -148,6 +164,11 @@ function setupAssessment() {
   const sessions = ensureSheet_(ss, APP.SHEETS.SESSIONS, HEADERS.SESSIONS);
   const responses = ensureSheet_(ss, APP.SHEETS.RESPONSES, HEADERS.RESPONSES);
   const snapshots = ensureSheet_(ss, APP.SHEETS.SNAPSHOTS, HEADERS.SNAPSHOTS);
+  const sessionQuestions = ensureSheet_(
+    ss,
+    APP.SHEETS.SESSION_QUESTIONS,
+    HEADERS.SESSION_QUESTIONS
+  );
 
   ensureSetting_(settings, 'AssessmentTitle', APP.DEFAULT_TITLE);
   ensureSetting_(settings, 'DurationMinutes', APP.DEFAULT_DURATION_MINUTES);
@@ -175,7 +196,15 @@ function setupAssessment() {
     ]);
   }
 
-  [settings, questions, candidates, sessions, responses, snapshots].forEach((sheet) => {
+  [
+    settings,
+    questions,
+    candidates,
+    sessions,
+    responses,
+    snapshots,
+    sessionQuestions,
+  ].forEach((sheet) => {
     sheet.setFrozenRows(1);
     sheet.autoResizeColumns(1, sheet.getLastColumn());
   });
@@ -283,7 +312,6 @@ function startAssessment(token, clientInfo) {
     if (!candidate.active) return failure_('This candidate link is inactive.');
 
     const questions = getQuestions_();
-    if (questions.length === 0) return failure_('No assessment questions have been configured.');
 
     const settings = getSettings_();
     const durationMinutes = Math.max(
@@ -295,21 +323,28 @@ function startAssessment(token, clientInfo) {
     let session = findLatestSessionByToken_(cleanToken);
     if (session) {
       if (session.status === 'IN_PROGRESS') {
-        if (now.getTime() > session.deadlineAt.getTime()) {
-          completeSession_(session, 'TIME_EXPIRED', now);
-          updateCandidateStatus_(candidate.rowNumber, 'TIME_EXPIRED');
-          return failure_('The time allowed for this assessment has expired.');
-        }
-        return buildClientState_(session, questions, now);
+        // Return the current question even after the deadline. The browser can
+        // then restore its locally saved answer and submit it as overtime.
+        return buildClientState_(session, getQuestionsForSession_(session), now);
       }
 
       return failure_('This candidate link has already been used.');
+    }
+
+    if (questions.length === 0) return failure_('No assessment questions have been configured.');
+    const uniqueQuestionIds = new Set(questions.map((question) => question.id));
+    if (uniqueQuestionIds.size !== questions.length) {
+      return failure_('The assessment contains duplicate QuestionID values. Ask the administrator to correct the Questions sheet.');
     }
 
     const startedAt = now;
     const deadlineAt = new Date(startedAt.getTime() + durationMinutes * 60 * 1000);
     const sessionId = Utilities.getUuid();
     const browserInfo = truncate_(JSON.stringify(clientInfo || {}), 2000);
+
+    // Freeze the exact question set before creating the session so later edits
+    // or imports cannot change an assessment that is already in progress.
+    saveSessionQuestions_(sessionId, questions);
 
     appendMappedRow_(APP.SHEETS.SESSIONS, {
       SessionID: sessionId,
@@ -360,6 +395,7 @@ function saveAndNext(payload) {
     const session = findSessionById_(sessionId);
     if (!session) return failure_('The assessment session could not be found.');
     if (session.status !== 'IN_PROGRESS') {
+      updateCandidateStatusByToken_(session.token, session.status);
       return {
         ok: true,
         completed: true,
@@ -368,7 +404,7 @@ function saveAndNext(payload) {
       };
     }
 
-    const questions = getQuestions_();
+    const questions = getQuestionsForSession_(session);
     const index = Number(session.currentQuestionIndex);
     const question = questions[index];
     if (!question) {
@@ -391,6 +427,7 @@ function saveAndNext(payload) {
     const now = new Date();
     const overTime = now.getTime() > session.deadlineAt.getTime();
     const forceComplete = Boolean(payload.forceComplete);
+    const submissionId = truncate_(String(payload.submissionId || Utilities.getUuid()), 200);
     const answer = String(payload.answer == null ? '' : payload.answer).trim();
     const answerWords = countWords_(answer);
 
@@ -444,9 +481,16 @@ function saveAndNext(payload) {
       shownAt,
       receivedAt: now,
       elapsedMs,
+      submissionId,
     });
 
-    appendMappedRow_(APP.SHEETS.RESPONSES, {
+    appendSnapshotRows_(snapshots);
+    const questionSnapshotCount = countSnapshotsForQuestion_(
+      session.sessionId,
+      question.id
+    );
+
+    upsertResponseForQuestion_(session.sessionId, question.id, {
       SessionID: session.sessionId,
       Token: session.token,
       CandidateName: safeForSheet_(session.candidateName),
@@ -482,10 +526,9 @@ function saveAndNext(payload) {
       RedoCount: redoCount,
       LastEditSecondsClient: lastEditMs == null ? '' : round_(lastEditMs / 1000, 2),
       EditingSpanSecondsClient: editingSpanMs == null ? '' : round_(editingSpanMs / 1000, 2),
-      SnapshotCount: snapshots.length,
+      SnapshotCount: questionSnapshotCount,
+      SubmissionID: safeForSheet_(submissionId),
     });
-
-    appendSnapshotRows_(snapshots);
 
     const nextIndex = index + 1;
     const isLastQuestion = nextIndex >= questions.length;
@@ -511,7 +554,7 @@ function saveAndNext(payload) {
         TotalRevisionEvents: session.totalRevisionEvents + revisionEvents,
         TotalUndoCount: session.totalUndoCount + undoCount,
         TotalRedoCount: session.totalRedoCount + redoCount,
-        TotalSnapshotCount: session.totalSnapshotCount + snapshots.length,
+        TotalSnapshotCount: countSnapshotsForSession_(session.sessionId),
       });
       updateCandidateStatusByToken_(session.token, finalStatus);
 
@@ -543,11 +586,59 @@ function saveAndNext(payload) {
       TotalRevisionEvents: session.totalRevisionEvents + revisionEvents,
       TotalUndoCount: session.totalUndoCount + undoCount,
       TotalRedoCount: session.totalRedoCount + redoCount,
-      TotalSnapshotCount: session.totalSnapshotCount + snapshots.length,
+      TotalSnapshotCount: countSnapshotsForSession_(session.sessionId),
     });
 
     const updatedSession = findSessionById_(session.sessionId);
     return buildClientState_(updatedSession, questions, now);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Persists incremental answer snapshots while a question is still open.
+ * Snapshot IDs make retries safe, and the final submission can resend any
+ * snapshot whose acknowledgement was lost.
+ */
+function saveProgress(payload) {
+  payload = payload || {};
+  const sessionId = String(payload.sessionId || '').trim();
+  if (!sessionId) return failure_('The assessment session is missing.');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+
+  try {
+    const session = findSessionById_(sessionId);
+    if (!session || session.status !== 'IN_PROGRESS') {
+      return failure_('The assessment session is no longer in progress.');
+    }
+
+    const questions = getQuestionsForSession_(session);
+    const question = questions[Number(session.currentQuestionIndex)];
+    if (!question || String(payload.questionId || '') !== question.id) {
+      return failure_('The assessment has moved to another question.');
+    }
+
+    const receivedAt = new Date();
+    const shownAt = session.currentQuestionShownAt;
+    const elapsedMs = Math.max(0, receivedAt.getTime() - shownAt.getTime());
+    const submissionId = truncate_(String(payload.submissionId || ''), 200);
+    const snapshots = normaliseSnapshots_(payload.snapshots, {
+      session,
+      question,
+      shownAt,
+      receivedAt,
+      elapsedMs,
+      submissionId,
+    });
+
+    appendSnapshotRows_(snapshots);
+    return {
+      ok: true,
+      savedSnapshotIds: snapshots.map((snapshot) => snapshot.SnapshotID),
+    };
   } finally {
     lock.releaseLock();
   }
@@ -573,6 +664,23 @@ function validateAssessmentSetup() {
   if (!getSpreadsheet_().getSheetByName(APP.SHEETS.SNAPSHOTS)) {
     problems.push('AnswerSnapshots sheet is missing. Run setupAssessment.');
   }
+  if (!getSpreadsheet_().getSheetByName(APP.SHEETS.SESSION_QUESTIONS)) {
+    problems.push('SessionQuestions sheet is missing. Run setupAssessment.');
+  }
+
+  [
+    [APP.SHEETS.RESPONSES, ['SubmissionID']],
+    [APP.SHEETS.SNAPSHOTS, ['SnapshotID', 'SubmissionID']],
+  ].forEach(([sheetName, requiredHeaders]) => {
+    const sheet = getSpreadsheet_().getSheetByName(sheetName);
+    if (!sheet) return;
+    const table = getTable_(sheetName);
+    requiredHeaders.forEach((header) => {
+      if (!(header in table.map)) {
+        problems.push(`${sheetName} is missing ${header}. Run setupAssessment.`);
+      }
+    });
+  });
 
   const ids = new Set();
   questions.forEach((question) => {
@@ -647,10 +755,75 @@ function appendMappedRow_(sheetName, valuesByHeader) {
   table.sheet.appendRow(row);
 }
 
+function upsertResponseForQuestion_(sessionId, questionId, valuesByHeader) {
+  const table = getTable_(APP.SHEETS.RESPONSES);
+  let rowIndex = -1;
+  for (let index = table.rows.length - 1; index >= 0; index -= 1) {
+    const row = table.rows[index];
+    if (
+      String(row[table.map.SessionID] || '').trim() === sessionId &&
+      String(row[table.map.QuestionID] || '').trim() === questionId
+    ) {
+      rowIndex = index;
+      break;
+    }
+  }
+
+  const row = rowIndex >= 0
+    ? table.rows[rowIndex].slice()
+    : Array(table.headers.length).fill('');
+  Object.keys(valuesByHeader).forEach((header) => {
+    if (!(header in table.map)) {
+      throw new Error(`Required Responses column is missing: ${header}. Run setupAssessment.`);
+    }
+    row[table.map[header]] = valuesByHeader[header];
+  });
+
+  if (rowIndex >= 0) {
+    table.sheet.getRange(rowIndex + 2, 1, 1, table.headers.length).setValues([row]);
+  } else {
+    table.sheet.appendRow(row);
+  }
+}
+
+function countSnapshotsForQuestion_(sessionId, questionId) {
+  const table = getTable_(APP.SHEETS.SNAPSHOTS);
+  return table.rows.reduce((count, row) => {
+    return count + (
+      String(row[table.map.SessionID] || '').trim() === sessionId &&
+      String(row[table.map.QuestionID] || '').trim() === questionId
+        ? 1
+        : 0
+    );
+  }, 0);
+}
+
+function countSnapshotsForSession_(sessionId) {
+  const table = getTable_(APP.SHEETS.SNAPSHOTS);
+  return table.rows.reduce((count, row) => {
+    return count + (
+      String(row[table.map.SessionID] || '').trim() === sessionId ? 1 : 0
+    );
+  }, 0);
+}
+
 function appendSnapshotRows_(snapshots) {
   if (!snapshots.length) return;
   const table = getTable_(APP.SHEETS.SNAPSHOTS);
-  const rows = snapshots.map((snapshot) => {
+  const existingIds = new Set(
+    table.rows
+      .map((row) => String(row[table.map.SnapshotID] || '').trim())
+      .filter(Boolean)
+  );
+  const newSnapshots = snapshots.filter((snapshot) => {
+    const snapshotId = String(snapshot.SnapshotID || '').trim();
+    if (!snapshotId || existingIds.has(snapshotId)) return false;
+    existingIds.add(snapshotId);
+    return true;
+  });
+  if (!newSnapshots.length) return;
+
+  const rows = newSnapshots.map((snapshot) => {
     const row = Array(table.headers.length).fill('');
     Object.keys(snapshot).forEach((header) => {
       if (header in table.map) row[table.map[header]] = snapshot[header];
@@ -687,6 +860,14 @@ function normaliseSnapshots_(rawSnapshots, context) {
       : '';
     const reasonValue = String(snapshot.reason || 'interval').trim().toLowerCase();
     const reason = permittedReasons.has(reasonValue) ? reasonValue : 'interval';
+    const sequence = Math.max(1, nonNegativeInteger_(snapshot.sequence) || index + 1);
+    const suppliedSnapshotId = truncate_(String(snapshot.snapshotId || '').trim(), 200);
+    const snapshotId = suppliedSnapshotId || [
+      context.session.sessionId,
+      context.question.id,
+      sequence,
+      Math.round(capturedMs),
+    ].join(':');
 
     return {
       SessionID: context.session.sessionId,
@@ -696,7 +877,7 @@ function normaliseSnapshots_(rawSnapshots, context) {
       QuestionOrder: context.question.order,
       QuestionID: context.question.id,
       GroupID: safeForSheet_(context.question.groupId),
-      SnapshotSequence: index + 1,
+      SnapshotSequence: sequence,
       Reason: reason,
       CapturedSecondsClient: round_(capturedMs / 1000, 2),
       ActiveSecondsClient: round_(activeMs / 1000, 2),
@@ -714,6 +895,8 @@ function normaliseSnapshots_(rawSnapshots, context) {
       SnapshotTextTruncated: storeSnapshotText && textWasTruncated,
       QuestionShownAtServer: context.shownAt,
       ServerReceivedAt: context.receivedAt,
+      SnapshotID: safeForSheet_(snapshotId),
+      SubmissionID: safeForSheet_(context.submissionId || ''),
     };
   });
 }
@@ -782,6 +965,78 @@ function getQuestions_() {
   });
 
   questions.sort((a, b) => a.order - b.order);
+  return questions;
+}
+
+function saveSessionQuestions_(sessionId, questions) {
+  const table = getTable_(APP.SHEETS.SESSION_QUESTIONS);
+  const rows = questions.map((question, index) => {
+    const row = Array(table.headers.length).fill('');
+    const values = {
+      SessionID: sessionId,
+      QuestionIndex: index,
+      Order: question.order,
+      QuestionID: question.id,
+      GroupID: safeForSheet_(question.groupId),
+      QuestionText: safeForSheet_(question.text),
+      AnswerType: question.answerType,
+      Options: safeForSheet_(JSON.stringify(question.options)),
+      Required: question.required,
+      MaxWords: question.maxWords == null ? '' : question.maxWords,
+    };
+    Object.keys(values).forEach((header) => {
+      if (!(header in table.map)) {
+        throw new Error(
+          `Required ${APP.SHEETS.SESSION_QUESTIONS} column is missing: ${header}. Run setupAssessment.`
+        );
+      }
+      row[table.map[header]] = values[header];
+    });
+    return row;
+  });
+
+  if (rows.length) {
+    table.sheet
+      .getRange(table.sheet.getLastRow() + 1, 1, rows.length, table.headers.length)
+      .setValues(rows);
+  }
+}
+
+function getQuestionsForSession_(session, fallbackQuestions) {
+  const sheet = getSpreadsheet_().getSheetByName(APP.SHEETS.SESSION_QUESTIONS);
+  if (!sheet) return fallbackQuestions || getQuestions_();
+
+  const table = getTable_(APP.SHEETS.SESSION_QUESTIONS);
+  const questions = table.rows
+    .filter((row) => String(row[table.map.SessionID] || '').trim() === session.sessionId)
+    .map((row) => {
+      let options = [];
+      try {
+        const parsed = JSON.parse(String(row[table.map.Options] || '[]'));
+        options = Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch (error) {
+        options = String(row[table.map.Options] || '')
+          .split('|')
+          .map((option) => option.trim())
+          .filter(Boolean);
+      }
+      const maxWordsValue = Number(row[table.map.MaxWords]);
+      return {
+        index: Number(row[table.map.QuestionIndex]) || 0,
+        order: Number(row[table.map.Order]),
+        id: String(row[table.map.QuestionID] || '').trim(),
+        groupId: String(row[table.map.GroupID] || ''),
+        text: String(row[table.map.QuestionText] || ''),
+        answerType: String(row[table.map.AnswerType] || 'long_text'),
+        options,
+        required: toBoolean_(row[table.map.Required]),
+        maxWords:
+          Number.isFinite(maxWordsValue) && maxWordsValue > 0 ? maxWordsValue : null,
+      };
+    });
+
+  if (!questions.length) return fallbackQuestions || getQuestions_();
+  questions.sort((a, b) => a.index - b.index);
   return questions;
 }
 
